@@ -1,7 +1,7 @@
 {
   "name": "clauderipple",
-  "version": "0.8.0",
-  "description": "Use GPT (ChatGPT Plus/Pro), DeepSeek and 400+ other models in the Claude Desktop Code tab and Claude Code while staying signed in to your Claude subscription — no third-party gateway mode. Several ChatGPT accounts that take over when one runs out, in Codex too.",
+  "version": "0.12.7",
+  "description": "Use GPT (any ChatGPT plan with Codex), DeepSeek and 400+ other models in the Claude Desktop Code tab and Claude Code while staying signed in to your Claude subscription — no third-party gateway mode. Several ChatGPT accounts that take over when one runs out, in Codex too.",
   "license": "GPL-3.0-only",
   "workspaces": [
     "packages/*"
@@ -10,11 +10,15 @@
     "node": ">=24"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/remote/tsconfig.web.json --noEmit && tsc -p packages/remote/relay/tsconfig.json --noEmit",
     "dist": "npm --workspace @clauderipple/app run dist",
     "release": "npm --workspace @clauderipple/app run release",
     "router": "node packages/router/src/index.ts",
-    "test": "node --test packages/router/test/*.test.ts packages/cli/test/*.test.ts",
+    "remote": "node --disable-warning=ExperimentalWarning packages/remote/src/main.ts",
+    "relay:build": "node --disable-warning=ExperimentalWarning packages/remote/relay/build-web.ts",
+    "relay:dev": "npm run relay:build && wrangler dev -c packages/remote/relay/wrangler.toml --ip 127.0.0.1 --port 8798",
+    "relay:deploy": "npm run relay:build && wrangler deploy -c packages/remote/relay/wrangler.toml",
+    "test": "node --test packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts",
     "cli": "node packages/cli/src/index.ts",
     "prepack": "node scripts/build-npm.mjs",
     "build": "node scripts/build-npm.mjs"
@@ -33,7 +37,11 @@
     "dist/",
     "docs/ARCHITECTURE.md",
     "CHANGELOG.md",
-    "README.ko.md"
+    "README.ko.md",
+    "README.zh-CN.md",
+    "README.ja.md",
+    "README.es.md",
+    "README.pt-BR.md"
   ],
   "publishConfig": {
     "access": "public"
@@ -69,6 +77,13 @@
     "url": "https://github.com/PBJ-2/clauderipple/issues"
   },
   "dependencies": {
-    "proper-lockfile": "^4.1.2"
+    "@anthropic-ai/claude-agent-sdk": "0.3.283",
+    "qrcode-generator": "2.0.4",
+    "tweetnacl": "1.0.3",
+    "web-push": "3.6.7",
+    "ws": "8.21.3",
+    "zod": "4.1.12",
+    "proper-lockfile": "^4.1.2",
+    "undici": "7.24.4"
   }
 }

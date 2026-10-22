@@ -1,5 +1,5 @@
-// Runtime view of Claude subscription accounts: current Claude Code/Desktop login first, followed by
-// ClaudeRipple-owned OAuth accounts. Stored grants are refreshed just before expiry and projected as
+// Runtime view of Claude subscription accounts: current Claude Code/Desktop login first (unless the
+// user marked a stored account preferred, which then leads), followed by ClaudeRipple-owned OAuth accounts. Stored grants are refreshed just before expiry and projected as
 // ordinary proxy credentials, so the shared CredentialPool supplies affinity, cooldown and retry.
 
 import crypto from "node:crypto";
@@ -66,6 +66,7 @@ export class ClaudeAccountAuthPool {
       ...(options.observed ? { observed: options.observed } : {}),
       ...(options.env ? { env: options.env } : {}),
       ...(options.now ? { now: options.now } : {}),
+      ...(options.credentialReaders ? { credentialReaders: options.credentialReaders } : {}),
     });
   }
 
@@ -149,7 +150,7 @@ export class ClaudeAccountAuthPool {
       // The legacy single-account file is also what ClaudeCodeAuthStore read as current. Until the
       // first migration write, omit that duplicate instead of trying the same token twice.
       if (currentToken && account.token === currentToken) continue;
-      out.push({
+      const credential: Credential = {
         id: credentialId(account.id, account.token, account.refreshToken),
         ownerId: account.id,
         label: account.label,
@@ -157,7 +158,11 @@ export class ClaudeAccountAuthPool {
           { type: "anthropic", auth: "claude-code" },
           { accessToken: account.token, expiresAt: account.expiresAt },
         ),
-      });
+      };
+      // The pool tries credentials in this order, so the account the user chose goes ahead of the
+      // current login. A conversation already held by another account stays there (its cache).
+      if (account.preferred) out.unshift(credential);
+      else out.push(credential);
     }
     return out;
   }

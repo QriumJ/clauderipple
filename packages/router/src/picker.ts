@@ -10,8 +10,10 @@
 // heuristically (anything that is not the claude.ai chat surface); the ids we saw are
 // logged once so the heuristic can be tightened.
 
-import type { CliModel } from "./config.ts";
+import type { CliModel, Config } from "./config.ts";
+import { resolve } from "./routing.ts";
 import { clampEffort } from "./compat.ts";
+import { isJudgeOnlyModel } from "./model-policy.ts";
 
 export const BOOTSTRAP_PATHS = ["/edge-api/bootstrap", "/api/bootstrap"];
 
@@ -59,6 +61,34 @@ function narrowThinking(entry: ModelEntry, levels: string[]): void {
   entry.thinking = { ...thinking, effort_options: kept.map(({ recommended: _recommended, ...option }) => (option.id === preferred ? { ...option, recommended: true } : option)) };
 }
 
+/** Resolve aliases/routes before advertising an entry; a chat-looking alias can target a judge. */
+export function chatPickerModels(cfg: Config): CliModel[] {
+  return cfg.cli.extraModels
+    .filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""))
+    .map(entry => {
+      if (entry.contextWindow) return entry;
+      const window = providerModelWindow(cfg, entry.model);
+      return window ? { ...entry, contextWindow: window } : entry;
+    });
+}
+
+/**
+ * The window a provider declared for `model` (its `/models` context length, or one set by hand),
+ * by id without an `@effort` suffix or through an alias. A picker entry saved without a window of
+ * its own used to fall to `cli.autoCompactWindow` although its provider knew better: a 1M MiniMax
+ * subagent compacted twice at ~240K (2026-10-21).
+ */
+export function providerModelWindow(cfg: Config, model: string): number | undefined {
+  const base = model.split("@")[0]!;
+  const ids = new Set([base, cfg.aliases[base] ?? base]);
+  for (const provider of Object.values(cfg.providers)) {
+    for (const entry of ("models" in provider && provider.models) || []) {
+      if (ids.has(entry.id) && typeof entry.contextWindow === "number" && entry.contextWindow > 0) return entry.contextWindow;
+    }
+  }
+  return undefined;
+}
+
 export type PickerModelEntry = { id: string; name: string };
 export type InjectResult = { injected: number; surfaces: { id: string; models: string[]; entries: PickerModelEntry[] }[] };
 
@@ -68,6 +98,7 @@ export type InjectResult = { injected: number; surfaces: { id: string; models: s
  */
 export function injectPickerModels(json: Record<string, unknown>, extra: CliModel[], contextWindow?: number, effortFor?: (model: string) => string[] | undefined): InjectResult {
   const result: InjectResult = { injected: 0, surfaces: [] };
+  extra = extra.filter(e => !isJudgeOnlyModel(e.model));
   const msc = json.model_selector_config;
   if (!Array.isArray(msc) || extra.length === 0) return result;
   for (const surface of msc as Surface[]) {

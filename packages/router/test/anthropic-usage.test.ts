@@ -19,6 +19,32 @@ test("the usage body maps onto the Codex snapshot shape the GUI already reads", 
   assert.equal(claudeUsageFromBody(null), null);
 });
 
+test("weekly_scoped entries ride beside rate_limits for the mod's per-model row", () => {
+  const body = {
+    ...BODY,
+    limits: [
+      // Shape measured 2026-10-15.
+      { kind: "weekly_scoped", group: "weekly", percent: 2, severity: "normal", resets_at: "2026-10-15T10:59:59.851460+00:00", scope: { model: { id: null, display_name: "Fable" }, surface: null }, is_active: false },
+      { kind: "weekly_scoped", group: "weekly", percent: 41, severity: "normal", resets_at: "2026-10-15T10:59:59.851460+00:00", scope: { model: { id: null, display_name: "Opus" }, surface: null }, is_active: true },
+      // Other kinds, nameless models and unusable percents are left out.
+      { kind: "daily_scoped", group: "daily", percent: 9, scope: { model: { display_name: "Daily" } } },
+      { kind: "weekly_scoped", group: "weekly", percent: 3, scope: { model: { id: null, display_name: null } } },
+      { kind: "weekly_scoped", group: "weekly", percent: "many", scope: { model: { display_name: "Vague" } } },
+      null,
+    ],
+  };
+  const q = claudeUsageFromBody(body) as { scoped: Record<string, number | string>[] };
+  const resetAt = Math.round(Date.parse("2026-10-15T10:59:59.851460+00:00") / 1000);
+  assert.deepEqual(q.scoped, [
+    { name: "Fable", used_percent: 2, window_minutes: 10080, reset_at: resetAt },
+    { name: "Opus", used_percent: 41, window_minutes: 10080, reset_at: resetAt },
+  ]);
+  // Without scoped entries the snapshot keeps its old shape exactly.
+  const plain = claudeUsageFromBody(BODY) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(plain, "scoped"), false);
+  assert.deepEqual(Object.keys(plain).sort(), ["at", "rate_limits", "type"]);
+});
+
 test("each account is asked once per interval with its own headers, and a failure keeps the last numbers", async () => {
   let now = 1_000_000;
   const calls: string[] = [];

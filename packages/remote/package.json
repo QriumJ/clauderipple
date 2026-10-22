@@ -1,0 +1,28 @@
+{
+  "name": "@clauderipple/remote",
+  "version": "0.8.10",
+  "private": true,
+  "type": "module",
+  "description": "Ripple Remote: a host on this machine that runs Claude Code sessions in any folder on any routed model, and a phone-first web app that drives them.",
+  "license": "GPL-3.0-only",
+  "scripts": { "test": "node --test test/*.test.ts" },
+  "bin": {
+    "ripple-host": "./src/main.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.283",
+    "qrcode-generator": "2.0.4",
+    "tweetnacl": "1.0.3",
+    "web-push": "3.6.7",
+    "ws": "8.21.3",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/web-push": "3.6.4",
+    "@types/ws": "8.18.1",
+    "wrangler": "4.142.0"
+  }
+}

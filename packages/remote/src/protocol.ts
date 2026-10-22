@@ -1,0 +1,284 @@
+// Wire protocol between ripple-host and the phone client. Types and constants only, no
+// imports: the host also serves this file to the browser (as /src/protocol.ts), so both ends
+// read the same numbers.
+//
+// Every session has an append-only event log. An event's `seq` counts from 1 inside one
+// `epoch`; a new epoch means the log was replaced (never happens in normal operation) and a
+// client must drop what it holds for that session. A client that reconnects asks for
+// everything after the last `seq` it has, so a re-attach is cheap and idempotent.
+
+/** Largest WebSocket frame either side sends, in bytes of UTF-8 JSON (Paseo #2610: 8 MB killed the socket). */
+export const FRAME_CAP = 256 * 1024;
+/** A string field longer than this is moved out of the event into a blob fetched on demand. */
+export const INLINE_CAP = 32 * 1024;
+/** Client pings this often; either side calls the link stale after STALE_MS of silence. */
+export const PING_MS = 10_000;
+export const STALE_MS = 30_000;
+/** Reconnect backoff is min(BACKOFF_CAP_MS, attempt × 1 s) and never stops. */
+export const BACKOFF_CAP_MS = 30_000;
+/** A socket that opens but is not ready (relay hello, host ready) within this is abandoned. */
+export const READY_MS = 8_000;
+/** Largest frame the relay forwards: an encrypted FRAME_CAP frame (16-byte tag) with room to spare. */
+export const RELAY_FRAME_CAP = FRAME_CAP + 1024;
+
+/**
+ * The relay's own words (plain text frames; everything else it forwards untouched, encrypted):
+ *   to the host's control socket: {"relay":"hello"} once accepted, {"relay":"connect","conn":id} per phone;
+ *   to a phone: {"relay":"open"} once the host's data socket for it is there.
+ * The host pings its control socket with the text "ping" and the relay answers "pong".
+ */
+export type RelayMsg = { relay: "hello" } | { relay: "connect"; conn: string } | { relay: "open" };
+/** Close codes the relay uses. `stale`: the host's control socket sent no ping for HOST_SILENT_MS. */
+export const RELAY_CLOSE = { badRequest: 4400, badSecret: 4401, hostOffline: 4404, stale: 4408, replaced: 4409, peerGone: 4410, tooBig: 1009 } as const;
+/**
+ * The relay routes phones only to the host's newest control socket, and only while that socket
+ * pinged within this long (PING_MS cadence; a missed ping or two is not a verdict).
+ */
+export const HOST_SILENT_MS = STALE_MS + PING_MS;
+
+export const PERMISSION_MODES = ["plan", "default", "acceptEdits", "auto", "bypassPermissions"] as const;
+export type PermissionMode = typeof PERMISSION_MODES[number];
+export interface Question { question: string; header: string; options: { label: string; description: string }[]; multiSelect: boolean }
+export interface PermissionContent { requestKind?: "tool" | "plan" | "question"; questions?: Question[] }
+
+export type Effort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+export type SessionState =
+  | "starting" // query spawned, no answer yet
+  | "running" // model or tool working
+  | "waiting" // a permission request is open
+  | "idle" // turn finished, ready for the next message
+  | "stopped" // no live query (host restarted, or closed); the next message resumes it
+  | "error"; // last turn ended in an error; the next message retries
+
+/** How a new session branches the folder it starts in. */
+export type Isolation = "local" | "worktree";
+
+/**
+ * Why a session wants the person's eye. The phone clears it when it opens that session, except
+ * `permission`, which clears only when the approval itself is answered (a phone can look and leave).
+ */
+export type AttentionReason = "permission" | "failed" | "finished";
+export interface Attention { reason: AttentionReason; at: number }
+
+/** A string moved out of an event (INLINE_CAP); the client fetches `/api/blob/<session>/<id>`. */
+export interface BlobRef { blob: string; bytes: number; preview: string }
+export type Text = string | BlobRef;
+
+/** Image bytes are base64 in the existing chunked blob transport, never in an event. */
+export interface ImagePart { type: "image"; blob?: string; mediaType: string; width?: number; height?: number }
+export interface MessageImages { images?: ImagePart[] }
+export const ATTACHMENT_CAP = 8 * 1024 * 1024;
+export const ATTACHMENT_COUNT = 8;
+export interface Attachment { blob: string; name: string; mediaType: string }
+export type SendBehavior = "steer" | "interrupt";
+export function defaultEffort(efforts: Effort[]): Effort | null { return efforts.includes("high") ? "high" : efforts[0] ?? null; }
+
+export interface ToolCall { id: string; name: string; /** one line a person reads: a command, a path */ summary: string; input?: Text; /** Computed before a large input becomes a blob. Counts describe supplied edits, not unseen file context. */ changes?: { added: number; removed: number } }
+
+export type EventBody = MessageImages & (
+  | { kind: "user"; text: string; clientMsgId: string }
+  | { kind: "turn"; model: string; effort: Effort | null }
+  /** Streamed text, coalesced by the host (~80 ms). Superseded by the `assistant` event with the same `msg`. */
+  | { kind: "delta"; msg: string; text: string }
+  /** One thinking block; deltas append, a final block replaces them (never expose signatures). */
+  | { kind: "thinking"; msg: string; block: number; text: Text; delta?: boolean }
+  | { kind: "assistant"; msg: string; model: string; text: Text; tools: ToolCall[] }
+  | { kind: "tool_result"; toolUseId: string; ok: boolean; text: Text }
+  /** A subagent ran; its own log is `sub` and loads only when asked (Paseo #5820). */
+  | { kind: "subagent"; toolUseId: string; sub: string; description: string; model: string | null; status: "running" | "done" | "failed"; steps: number }
+  | ({ kind: "permission"; id: string; tool: string; title: string; summary: string; input: Text; canAlways: boolean } & PermissionContent)
+  | { kind: "mode"; mode: PermissionMode }
+  | { kind: "permission_decided"; id: string; decision: "allow" | "allow_always" | "deny" | "expired"; reason?: string }
+  | { kind: "result"; ok: boolean; error?: string; ms: number; turns: number }
+  | { kind: "state"; state: SessionState; detail?: string }
+  | { kind: "figures"; figures: Figures }
+  | { kind: "notice"; code: NoticeCode; text?: string });
+
+export type NoticeCode = "host_restarted" | "interrupted" | "api_retry" | "router_down" | "model_changed" | "resumed" | "desktop_open" | "desktop_resumed" | "desktop_bridge" | "desktop_blocked";
+
+export type SessionEvent = EventBody & { seq: number; at: number };
+
+/**
+ * A push-worthy moment on a Mac session the host is not tailing: a turn finished (ok/failed) or an
+ * approval is waiting. It goes to the pushes only, never into a session log, so it carries just
+ * what they read — a bridged session's own result/permission events carry the rest.
+ */
+export type AlertBody = { kind: "permission" } | { kind: "result"; ok: boolean };
+/** What a push reads: a real log event, or an alert for a Mac session the host does not tail. */
+export type PushEvent = EventBody | AlertBody;
+
+/** The mod's figures, as the phone shows them under the header. Null means "not known", never zero. */
+export interface Figures {
+  effort: Effort | null;
+  /** cache read / all input of this session's main-model requests, 0–100 */
+  cachePct: number | null;
+  /** last request's input / the model's window, 0–100 */
+  contextPct: number | null;
+  /** Claude subscription 5-hour window used, 0–100 */
+  fiveHourPct: number | null;
+  fiveHourResetAt: number | null;
+  /** model → requests, for every model other than the session's own that served this session */
+  workers: { model: string; provider: string; requests: number }[];
+  /** last request's input tokens and the window they are read against; absent on older hosts */
+  contextTokens?: number | null;
+  contextWindow?: number | null;
+  /** where the session's latest main-model request went; null when the router has none; absent on older hosts */
+  route?: { model: string; provider: string; ok: boolean; status: number | null } | null;
+  at: number;
+}
+
+/** One provider window from the router's /api/limits, as the desktop band's limits row shows it. */
+export interface RippleLimit {
+  /** router provider name, e.g. "anthropic", "chatgpt"; `title` is what the band heads it with */
+  provider: string;
+  title: string;
+  /** account label when a provider pools several; absent for one */
+  account?: string;
+  kind: "five_hour" | "seven_day" | "scoped" | "window";
+  /** the router's own label for scoped/other windows; null for five_hour/seven_day */
+  label: string | null;
+  usedPct: number;
+  windowMinutes: number | null;
+  /** epoch ms; null when the router gave none */
+  resetAt: number | null;
+}
+
+/** What the ClaudeRipple mod is set to on this Mac, host-wide (it is not per session). */
+export interface RippleStatus {
+  /** the active operating mode from mod settings; null when none is active */
+  mode: { id: string; name: string; since: number | null } | null;
+  /** automatic effort on, and the range it is held in */
+  effortAuto: boolean;
+  effortFloor: Effort | null;
+  effortCeiling: Effort | null;
+  /** every provider window with a reset still ahead, Claude first */
+  limits: RippleLimit[];
+  at: number;
+}
+
+export interface SessionSummary {
+  id: string;
+  origin?: "host" | "desktop";
+  readOnly?: boolean;
+  title: string;
+  /** Desktop sidebar metadata; absent on older hosts. */
+  unread?: boolean;
+  group?: string;
+  order?: number;
+  cwd: string;
+  model: string;
+  effort: Effort | null;
+  permissionMode?: PermissionMode;
+  state: SessionState;
+  /** Main-turn state is authoritative for desktop Remote Control sessions. */
+  desktopBridge?: boolean;
+  /** Running background workers/shells, separate from the main turn. */
+  tasks?: number;
+  /** Desktop sessions: when the running main turn began, from the person's message in the transcript.
+   * The phone's event window may not reach back that far. Null when unknown; absent on older hosts. */
+  turnStartedAt?: number | null;
+  /** What those background tasks are, oldest first; absent on older hosts. */
+  taskList?: BackgroundTask[];
+  /** The main turn is idle but background work (subagents, shells) still runs: the app's dark blink. */
+  background?: boolean;
+  /** open permission requests */
+  pending: number;
+  /** The host's archive flag: an archived session leaves the default list but is never deleted
+   * (transcripts and files stay). Absent on older hosts. */
+  archived?: boolean;
+  /** The session wants the person's eye; the phone's `seen` clears all but a permission request.
+   * Absent on older hosts; null means nothing is waiting. */
+  attention?: Attention | null;
+  createdAt: number;
+  updatedAt: number;
+  lastSeq: number;
+  epoch: string;
+}
+
+export interface BackgroundTask { id: string; kind: "agent" | "shell"; label: string; startedAt: number | null }
+
+export interface ModelOption { model: string; name: string; provider: string; efforts: Effort[]; usable: boolean }
+export interface ProviderGroup { provider: string; label: string; usable: boolean; models: ModelOption[] }
+
+export interface FolderEntry { path: string; name: string; lastUsed?: number; model?: string }
+
+/**
+ * `desktopProblem`: why sends, approvals and live state for Claude app (Mac) sessions cannot work
+ * right now — this Mac's Claude login, in the host's words — absent when they can.
+ */
+export interface HostInfo { name: string; version: string; routerOk: boolean; routerProblem?: string; desktopProblem?: string;
+  /** the mod's mode, effort range and provider limits; absent on older hosts or when the router is down */
+  ripple?: RippleStatus }
+
+// ---- client → host --------------------------------------------------------------------
+
+export type ClientMsg =
+  | { t: "hello"; token: string; clientId: string }
+  | { t: "ping"; n: number }
+  /** `afterSeq` 0 or absent with no epoch: send the tail page. */
+  | { t: "attach"; session: string; epoch?: string; afterSeq?: number }
+  | { t: "detach"; session: string }
+  | { t: "history"; session: string; beforeSeq: number; reqId: string }
+  | { t: "create"; clientMsgId: string; cwd: string; model: string; effort: Effort | null; text: string; permissionMode?: PermissionMode; isolation?: Isolation; baseBranch?: string }
+  /** The phone is looking at this session now; clears its attention (a permission request stays). */
+  | { t: "seen"; session: string }
+  /** Archive/unarchive: a flag only, the session's transcripts and files stay. */
+  | { t: "archive"; session: string; archived: boolean }
+  /** "Mark unread": put the attention back, guessed from what the session is doing now. */
+  | { t: "unread"; session: string }
+  | { t: "set_mode"; reqId: string; sessionId: string; mode: PermissionMode }
+  | { t: "send"; session: string; clientMsgId: string; text: string; behavior?: SendBehavior; attachments?: Attachment[] }
+  | { t: "decide"; session: string; id: string; decision: "allow" | "allow_always" | "deny"; reqId?: string; message?: string; answers?: Record<string, string> }
+  | { t: "interrupt"; session: string; reqId?: string }
+  | { t: "set_model"; session: string; model: string; effort: Effort | null; reqId?: string }
+  /** The app is in front (visible) or not. Sent on change and every PING_MS while visible; the host pushes only when nobody is looking. */
+  | { t: "presence"; visible: boolean }
+  /** Request/response over the same socket, so a relay later forwards one stream and nothing else. */
+  | { t: "req"; reqId: string; op: ReqOp };
+
+export type ReqOp =
+  | { op: "models" }
+  | { op: "upload"; session: string; uploadId: string; offset: number; data: string; done: boolean }
+  | { op: "folders" }
+  | { op: "browse"; path?: string; hidden?: boolean }
+  /** Make a folder directly inside `parent`; `name` is one path segment, validated on the host. */
+  | { op: "mkdir"; parent: string; name: string }
+  /** What a folder's git situation is, for the new-session isolation choice. */
+  | { op: "git"; path: string }
+  | { op: "blob"; session: string; id: string; offset?: number }
+  | { op: "sub"; session: string; sub: string; afterSeq?: number }
+  /** Slash command names (no "/") the session accepts, for the composer's "/" menu. */
+  | { op: "commands"; session: string }
+  /** The host's VAPID public key (base64url), for PushManager.subscribe's applicationServerKey. */
+  | { op: "push_key" }
+  | { op: "push_subscribe"; subscription: PushSubscriptionJSON; lang: "ko" | "en" }
+  | { op: "push_unsubscribe" }
+  /** Optional native push key travels inside the authenticated E2EE channel, never via Expo. */
+  | { op: "expo_push_subscribe"; token: string; lang: "ko" | "en"; platform?: "ios" | "android"; key?: string }
+  | { op: "expo_push_unsubscribe" };
+
+/** PushSubscription.toJSON() as the browser gives it. */
+export interface PushSubscriptionJSON { endpoint: string; expirationTime?: number | null; keys: { p256dh: string; auth: string } }
+
+export interface BrowseResult { path: string; parent: string | null; home: string; entries: FolderEntry[]; truncated: boolean }
+/** A folder's git situation: whether it is inside a repo, that repo's root, its branch and local branches. */
+export interface GitInfo { isRepo: boolean; root: string | null; branch: string | null; branches: string[] }
+export interface BlobChunk { text: string; offset: number; next: number | null; bytes: number }
+export interface SubPage { events: SessionEvent[]; more: boolean }
+
+// ---- host → client --------------------------------------------------------------------
+
+export type HostMsg =
+  | { t: "ready"; host: HostInfo; sessions: SessionSummary[]; groups?: string[] | undefined }
+  | { t: "pong"; n: number }
+  | { t: "denied"; reason: "token" }
+  /** Events after the client's seq. `more` means another frame follows at once. `tail` means older events exist before `events[0]`. */
+  | { t: "events"; session: string; epoch: string; events: SessionEvent[]; more: boolean; tail?: { hasOlder: boolean } }
+  | { t: "history"; session: string; reqId: string; events: SessionEvent[]; hasOlder: boolean }
+  | { t: "sessions"; sessions: SessionSummary[]; groups?: string[] | undefined }
+  | { t: "host"; host: HostInfo }
+  | { t: "ack"; clientMsgId: string; session: string }
+  | { t: "res"; reqId: string; ok: true; data: unknown }
+  | { t: "res"; reqId: string; ok: false; error: string }
+  | { t: "error"; code: string; message: string; clientMsgId?: string; session?: string };

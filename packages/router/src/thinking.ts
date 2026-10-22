@@ -1,20 +1,30 @@
 // Thinking blocks another model left in a conversation that is now going to Anthropic.
 //
-// The translated providers hand the CLI their reasoning as `thinking` blocks with no signature —
-// there is no Anthropic signature to give — and an empty `thinking` when the upstream sent a
-// reasoning item without a summary. The CLI keeps them in the transcript, so a session switched
-// from such a model to a Claude model replays them, and Anthropic refuses the whole request:
-// "messages.2.content.0.thinking: each thinking block must contain thinking" (measured 2026-09-28,
-// gpt-6-astra → claude-opus-5-5, every retry of the turn). A block Anthropic wrote always carries a
-// signature, so an unsigned one is foreign and goes; the translated providers drop thinking from
-// replayed history for the same reason (ARCHITECTURE §4, "Cache-safety decisions").
+// The translated providers hand the CLI their reasoning as `thinking` blocks, and an empty `thinking`
+// when the upstream sent a reasoning item without a summary. The CLI keeps them in the transcript, so
+// a session switched from such a model to a Claude model replays them, and Anthropic refuses the
+// whole request: "messages.2.content.0.thinking: each thinking block must contain thinking" (measured
+// 2026-09-28, gpt-6-astra → claude-opus-5-5, every retry of the turn).
+//
+// A block Anthropic wrote always carries a signature of Anthropic's own, a base64 string this router
+// cannot produce. A translation provider cannot produce one either, so it signs with an envelope of
+// its own naming where the reasoning came from (reasoning.ts) — which Anthropic would refuse just as
+// fast, and which is why those go too. What is left that is signed is Anthropic's.
+//
+// The translated adapters themselves keep their own replayed reasoning (that is the point of the
+// envelope), so this is the one place a translated provider's thinking must still be dropped: a
+// CLI-side switch to a Claude model. Gemini and the other translators drop `thinking` on their own.
+import { isOurSignature } from "./reasoning.ts";
 
 type Block = { type?: unknown; signature?: unknown };
 type Message = { role?: unknown; content?: unknown };
 
 function foreign(block: unknown): boolean {
   const b = block as Block | null;
-  return !!b && typeof b === "object" && b.type === "thinking" && !(typeof b.signature === "string" && b.signature.length > 0);
+  if (!b || typeof b !== "object" || b.type !== "thinking") return false;
+  // Unsigned: a translated provider's reasoning with nothing to carry, or an empty reasoning item.
+  // Ours: a translated provider's envelope, which only its own adapter can read back.
+  return !(typeof b.signature === "string" && b.signature.length > 0) || isOurSignature(b.signature);
 }
 
 /**

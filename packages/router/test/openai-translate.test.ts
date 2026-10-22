@@ -2,6 +2,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { OpenAiStreamMapper, toOpenAiRequest, type ChatRequest, type ResponsesRequest } from "../src/providers/openai/translate.ts";
 import { toolNameForResponses, toolNameRestoreMap, type AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
+import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
+
+/** The signature this router puts on a Chat reasoning block, as its own adapter would write it. */
+function CHAT_SIG(field: "reasoning_content" | "reasoning", model = "x", provider = ""): string {
+  return encodeEnvelope({ w: "chat", p: provider, m: model, f: field });
+}
+const ZEN = "opencode-zen";
+
+/** A carrier block as a Responses adapter hands it to Claude Code, around the vendor's own item. */
+function responsesCarrier(item: Record<string, unknown>, env = { p: "opencode-go", m: "muse-spark-1.3-contributor" }): { type: "thinking"; thinking: string; signature: string } {
+  return { type: "thinking", thinking: "", signature: encodeEnvelope({ w: "responses", p: env.p, m: env.m, r: item }) };
+}
 
 const request: AnthropicRequest = {
   model: "claude-opus-5",
@@ -88,6 +100,24 @@ test("tool result images survive on chat and responses wires", () => {
   assert.deepEqual(responses.input.map((item) => item.type), ["function_call", "function_call_output", "message"]);
   assert.deepEqual((responses.input[2] as { content: unknown[] }).content, [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }]);
   assert.equal(JSON.stringify({ chat, responses }).includes("[image omitted]"), false);
+});
+
+test("parallel tool results with images keep their tool messages together on chat (#64)", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } };
+  const ids = ["a", "b", "c"];
+  const request: AnthropicRequest = {
+    model: "m",
+    messages: [
+      { role: "user", content: "look" },
+      { role: "assistant", content: ids.map((id) => ({ type: "tool_use", id, name: "Read", input: {} })) },
+      { role: "user", content: [...ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: [image] })), { type: "text", text: "and?" }] },
+    ],
+  };
+  const chat = toOpenAiRequest(request, { model: "m", wire: "chat" }) as ChatRequest;
+
+  const turns = chat.messages.filter((m) => m.role !== "system");
+  assert.deepEqual(turns.map((m) => m.role), ["user", "assistant", "tool", "tool", "tool", "user"]);
+  assert.deepEqual((turns[5]?.content as { type: string }[]).map((part) => part.type), ["image_url", "image_url", "image_url", "text"]);
 });
 
 test("chat SSE mapper emits text, indexed tool calls and cached-token usage", () => {
@@ -286,7 +316,7 @@ test("chat SSE mapper relays reasoning as thinking, before the answer it precede
   const order = events.map((e) => e.event);
   assert.ok(order.indexOf("content_block_stop") < order.lastIndexOf("content_block_start"));
   assert.deepEqual(mapper.message().content, [
-    { type: "thinking", thinking: "The user wants one word." },
+    { type: "thinking", thinking: "The user wants one word.", signature: CHAT_SIG("reasoning_content", "mimo-v2.6-pro") },
     { type: "text", text: "ready" },
   ]);
 });
@@ -295,14 +325,16 @@ test("a turn that only reasons is no longer empty", () => {
   const mapper = new OpenAiStreamMapper("mimo-v2.6-pro");
   mapper.feed({ id: "c1", choices: [{ delta: { reasoning_content: "thinking out loud" }, finish_reason: "stop" }] }, "chat");
   mapper.finish();
-  assert.deepEqual(mapper.message().content, [{ type: "thinking", thinking: "thinking out loud" }]);
+  assert.deepEqual(mapper.message().content, [{ type: "thinking", thinking: "thinking out loud", signature: CHAT_SIG("reasoning_content", "mimo-v2.6-pro") }]);
 });
 
-// Vendors on this wire disagree on the field name; both must land in the same place.
+// Vendors on this wire disagree on the field name; both must land in the same place, and the name a
+// model was heard on is the one its reasoning is replayed under (reasoning.ts).
 test("reasoning under the bare `reasoning` name is relayed too", () => {
   const mapper = new OpenAiStreamMapper("other");
-  mapper.feed({ id: "c1", choices: [{ delta: { reasoning: "hmm" }, finish_reason: null }] }, "chat");
-  assert.deepEqual(mapper.message().content, [{ type: "thinking", thinking: "hmm" }]);
+  mapper.feed({ id: "c1", choices: [{ delta: { reasoning: "hmm" }, finish_reason: "stop" }] }, "chat");
+  mapper.finish();
+  assert.deepEqual(mapper.message().content, [{ type: "thinking", thinking: "hmm", signature: CHAT_SIG("reasoning", "other") }]);
 });
 
 // Claude Code checks a model it is switching to by asking it for a single token. Anthropic Messages
@@ -317,4 +349,216 @@ test("a Responses request asks for at least sixteen output tokens, whatever the 
   // Chat Completions has no such floor, so nothing is raised there.
   const chat = toOpenAiRequest({ ...request, max_tokens: 1 }, { ...options, wire: "chat" }) as ChatRequest;
   assert.equal(chat.max_tokens, 1);
+});
+
+// ---- reasoning replay (reasoning.ts) -----------------------------------------------------------
+
+const env = { p: "opencode-go", m: "muse-spark-1.3-contributor" };
+type ChatMsg = { role: string; content: unknown; reasoning?: string; reasoning_content?: string; tool_calls?: { id: string }[] };
+
+// The whole point: the reasoning the backend sealed comes back in the position it left, which for a
+// tool turn is immediately after the call it describes — the position the CLI replays it in.
+test("a Responses carrier is put back in place, beside the call it followed", () => {
+  const item = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" };
+  const carried = { replayed: 0, undecodable: 0 };
+  const out = toOpenAiRequest(
+    {
+      model: "m",
+      messages: [
+        { role: "user", content: "read it" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "let me read", signature: "" }, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+        { role: "assistant", content: [responsesCarrier(item), { type: "tool_use", id: "call_2", name: "Bash", input: { command: "ls" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_2", content: "y" }] },
+      ],
+    },
+    { model: env.m, wire: "responses", env, carried },
+  ) as ResponsesRequest;
+  // The envelope is read back byte-for-byte, and only type/id/summary/encrypted_content go out.
+  assert.deepEqual(out.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "read it" }] },
+    { type: "function_call", call_id: "call_1", name: "Read", arguments: '{"file_path":"a.ts"}' },
+    { type: "function_call_output", call_id: "call_1", output: "x" },
+    item,
+    { type: "function_call", call_id: "call_2", name: "Bash", arguments: '{"command":"ls"}' },
+    { type: "function_call_output", call_id: "call_2", output: "y" },
+  ]);
+  assert.deepEqual(out.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(carried, { replayed: 1, undecodable: 0 });
+});
+
+// A request with nothing to carry asks for nothing, and stays byte-identical to what went before:
+// `store: false` is what makes the backend seal its reasoning, so `include` is the only new field.
+test("a request with no reasoning of ours is unchanged: no include, nothing inserted", () => {
+  const plain: AnthropicRequest = { model: "m", messages: [{ role: "user", content: "hi" }] };
+  const withEnv = toOpenAiRequest(plain, { model: "muse", wire: "responses", env }) as ResponsesRequest;
+  const without = toOpenAiRequest(plain, { model: "muse", wire: "responses" }) as ResponsesRequest;
+  assert.equal(withEnv.include, undefined);
+  assert.deepEqual(withEnv.input, without.input);
+  assert.equal(JSON.stringify(withEnv).includes("reasoning.encrypted_content"), false);
+});
+
+// A foreign block — Anthropic's own thinking, another model's carrier, a corrupt one — must be
+// dropped rather than sent, or the request fails for a reason the user cannot act on.
+test("reasoning from another model, the other wire, or a corrupt envelope is not replayed", () => {
+  const item = { type: "reasoning", encrypted_content: "gAAAAsealed" };
+  const anthropics = { type: "redacted_thinking", data: "AnthropicOwnBlock" };
+  const otherModel = { type: "thinking", thinking: "", signature: encodeEnvelope({ w: "responses", p: "chatgpt", m: "gpt-6-astra", r: item }) };
+  const otherWire = { type: "thinking", thinking: "deepseek thought", signature: encodeEnvelope({ w: "chat", p: "opencode-zen", m: "deepseek-v4.1-flash", f: "reasoning_content" }) };
+  const corrupt = { type: "thinking", thinking: "", signature: "clauderipple.v1:@@@@" };
+  const carried = { replayed: 0, undecodable: 0 };
+  const dropped: string[] = [];
+  const out = toOpenAiRequest(
+    { model: "m", messages: [{ role: "user", content: "hi" }, { role: "assistant", content: [anthropics, otherModel, otherWire, corrupt, { type: "tool_use", id: "call_1", name: "Bash", input: {} }] }] },
+    { model: env.m, wire: "responses", env, carried, log: (line) => dropped.push(line) },
+  ) as ResponsesRequest;
+  assert.equal(JSON.stringify(out.input).includes("encrypted_content"), false);
+  assert.equal(out.include, undefined);
+  assert.deepEqual(carried, { replayed: 0, undecodable: 2 }, "the other model's and the corrupt one are counted; nothing was replayed");
+  assert.equal(dropped.length, 2);
+  // The other wire's carrier is not ours here either — it is simply not this request's to touch.
+  assert.equal(dropped.some((line) => line.includes("opencode-zen")), false);
+});
+
+// Chat has no sealed blob: the block's own text is the reasoning, replayed under the name the model
+// was heard on. Vendors on this wire disagree on that name (DeepSeek documents `reasoning_content`).
+test("chat reasoning goes back as reasoning_content on the assistant message, field name preserved", () => {
+  const deepseek: AnthropicRequest = {
+    model: "m",
+    messages: [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "I should read a.ts", signature: CHAT_SIG("reasoning_content", "deepseek-v4.1-flash", ZEN) }, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+    tools: [{ name: "Read", input_schema: { type: "object" } }],
+  };
+  const carried = { replayed: 0, undecodable: 0 };
+  const out = toOpenAiRequest(deepseek, { model: "deepseek-v4.1-flash", wire: "chat", env: { p: "opencode-zen", m: "deepseek-v4.1-flash" }, carried }) as ChatRequest;
+  const assistant = out.messages.find((m) => m.role === "assistant") as unknown as ChatMsg;
+  assert.equal(assistant.reasoning_content, "I should read a.ts");
+  assert.equal(assistant.tool_calls?.[0]?.id, "call_1");
+  assert.deepEqual(carried, { replayed: 1, undecodable: 0 });
+  // A model heard on `reasoning` is answered on `reasoning`, not renamed to the other spelling.
+  const relayOut = toOpenAiRequest(
+    { model: "m", messages: [{ role: "user", content: "hi" }, { role: "assistant", content: [{ type: "thinking", thinking: "hmm", signature: CHAT_SIG("reasoning", "x", ZEN) }] }] },
+    { model: "x", wire: "chat", env: { p: "opencode-zen", m: "x" } },
+  ) as ChatRequest;
+  const relayed = relayOut.messages[2] as unknown as ChatMsg;
+  assert.equal(relayed.reasoning, "hmm");
+  assert.equal(relayed.reasoning_content, undefined);
+});
+
+// Anthropic's own thinking is not ours to replay: signed by Anthropic, or with no signature at all,
+// it is display history, and neither wire may turn it into a vendor field.
+test("a foreign thinking block never becomes reasoning_content", () => {
+  const withForeign: AnthropicRequest = {
+    model: "m",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "anthropic's own", signature: "EqQBCkgIBxABGAIiQ" }, { type: "text", text: "ok" }] },
+    ],
+  };
+  const out = toOpenAiRequest(withForeign, { model: "x", wire: "chat", env: { p: "opencode-zen", m: "x" } }) as ChatRequest;
+  const msg = out.messages[2] as unknown as ChatMsg;
+  assert.equal(msg.reasoning_content, undefined);
+  assert.equal(msg.reasoning, undefined);
+  assert.equal(msg.content, "ok");
+});
+
+// A turn whose only content was the replayed reasoning is still a turn: it goes out with the
+// reasoning alone rather than vanishing from the history.
+test("a reasoning-only assistant turn is sent with its reasoning, not dropped", () => {
+  const out = toOpenAiRequest(
+    {
+      model: "m",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "just thinking", signature: CHAT_SIG("reasoning_content", "x", ZEN) }] },
+        { role: "user", content: "go on" },
+      ],
+    },
+    { model: "x", wire: "chat", env: { p: "opencode-zen", m: "x" } },
+  ) as ChatRequest;
+  assert.deepEqual(out.messages[2], { role: "assistant", content: null, reasoning_content: "just thinking" });
+});
+
+// `replay: false` is the retry after a vendor refused the carrier, and it must be exactly the request
+// this adapter sent before any of this existed.
+test("replay: false puts back the request without any reasoning", () => {
+  const chat = toOpenAiRequest(
+    {
+      model: "m",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "deepseek thought", signature: CHAT_SIG("reasoning_content", "x", ZEN) }, { type: "text", text: "ok" }] },
+      ],
+    },
+    { model: "x", wire: "chat", env: { p: "opencode-zen", m: "x" }, replay: false },
+  ) as ChatRequest;
+  // Index 0 is the identity system message this wire always prepends.
+  assert.deepEqual(chat.messages[2], { role: "assistant", content: "ok" });
+  assert.equal(JSON.stringify(chat).includes("reasoning"), false);
+  const responses = toOpenAiRequest(
+    { model: "m", messages: [{ role: "user", content: "hi" }, { role: "assistant", content: [responsesCarrier({ type: "reasoning", encrypted_content: "blob" })] }] },
+    { model: "x", wire: "responses", env: { p: "opencode-zen", m: "x" }, replay: false },
+  ) as ResponsesRequest;
+  assert.equal(responses.include, undefined);
+  assert.equal(JSON.stringify(responses.input).includes("encrypted_content"), false);
+});
+
+// The response path hands the client a carrier block whose envelope holds exactly the vendor's item,
+// so the next turn can put it back untouched. An item the backend never sealed has nothing to resume.
+test("a Responses reasoning item is sealed into a carrier block; an unsealed one is not", () => {
+  const mapper = new OpenAiStreamMapper("muse-spark-1.3-contributor", 0, new Map(), env);
+  mapper.wire = "responses";
+  const evs: Record<string, unknown>[] = [
+    { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" }, output_index: 0 },
+    { type: "response.reasoning_summary_text.delta", delta: "thinking…", item_id: "rs_1" },
+    { type: "response.output_item.done", item: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" } },
+    { type: "response.output_item.added", item: { type: "function_call", call_id: "call_1", id: "fc_1", name: "Bash" }, output_index: 1 },
+    { type: "response.output_item.done", item: { type: "function_call", id: "fc_1" } },
+    { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 2 } } },
+  ];
+  const out = evs.flatMap((e) => mapper.feed(e, "responses"));
+  const content = mapper.content as { type: string; thinking?: string; signature?: string }[];
+  assert.deepEqual(content.map((b) => b.type), ["thinking", "tool_use"]);
+  assert.equal(content[0]?.thinking, "thinking…");
+  assert.deepEqual(decodeEnvelope(content[0]?.signature), {
+    w: "responses",
+    p: "opencode-go",
+    m: "muse-spark-1.3-contributor",
+    r: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" },
+  });
+  assert.equal(mapper.reasoningCount, 1);
+  // The signature the client sees is the same one the envelope holds, and it closes the block.
+  const sigDelta = out.find((e) => e.event === "content_block_delta" && (e.data.delta as { type: string }).type === "signature_delta");
+  assert.equal((sigDelta?.data.delta as { signature: string }).signature, content[0]?.signature);
+  // One item is one block, however its summary and its state arrived.
+  assert.deepEqual(out.filter((e) => e.event === "content_block_start").map((e) => (e.data.content_block as { type: string }).type), ["thinking", "tool_use"]);
+  assert.equal(out.filter((e) => e.event === "content_block_stop").length, 2);
+
+  // An item with no `encrypted_content` is display text only: no signature, and nothing to replay.
+  const plain = new OpenAiStreamMapper("muse", 0, new Map(), env);
+  plain.wire = "responses";
+  plain.feed({ type: "response.output_item.added", item: { type: "reasoning", id: "rs_2" }, output_index: 0 }, "responses");
+  plain.feed({ type: "response.reasoning_summary_text.delta", delta: "just a summary", item_id: "rs_2" }, "responses");
+  plain.feed({ type: "response.output_item.done", item: { type: "reasoning", id: "rs_2" } }, "responses");
+  assert.deepEqual(plain.content, [{ type: "thinking", thinking: "just a summary", signature: "" }]);
+  assert.equal(plain.reasoningCount, 0);
+});
+
+// A vendor whose preset measured that it seals reasoning on request is asked on every turn, the first
+// included — waiting until a conversation already carried some would never start one. Anyone else
+// keeps the request it had, and the retry after a refusal asks for nothing.
+test("sealedReasoning asks for the sealed item and a summary from the first turn", () => {
+  const caps = { reasoning: "effort" as const };
+  const sealed = toOpenAiRequest(request, { model: "m", wire: "responses", effort: "high", caps, sealedReasoning: true }) as ResponsesRequest;
+  assert.deepEqual(sealed.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(sealed.reasoning, { effort: "high", summary: "auto" });
+  const plain = toOpenAiRequest(request, { model: "m", wire: "responses", effort: "high", caps }) as ResponsesRequest;
+  assert.equal(plain.include, undefined);
+  assert.deepEqual(plain.reasoning, { effort: "high" });
+  const retry = toOpenAiRequest(request, { model: "m", wire: "responses", effort: "high", caps, sealedReasoning: true, replay: false }) as ResponsesRequest;
+  assert.equal(retry.include, undefined);
+  assert.deepEqual(retry.reasoning, { effort: "high" });
 });

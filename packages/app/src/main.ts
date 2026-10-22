@@ -1,18 +1,30 @@
-// ClaudeRipple menu-bar app. It owns no logic: the router serves the GUI and the admin API on
-// 127.0.0.1; this shell adds a tray icon with live health, a window for the GUI, and shortcuts
-// for restart / logs / login. If the router is down the tray says so and offers to start it.
+// ClaudeRipple menu-bar app. The router owns the logic and the admin API on 127.0.0.1; this shell
+// adds a tray icon with live health, the dashboard window, and shortcuts for restart / logs / login.
+//
+// The window draws the dashboard from the app's own copy of packages/ui (protocol.ts) and only asks
+// the router for data, so it opens with the router dead — which is when it is needed: on
+// 2026-10-20 a broken launch entry took the router down, and the router-served dashboard with it,
+// and nothing was left to fix it from. A preload bridge lets the dashboard repair the router or
+// switch Claude to its default connection through the CLI (`doctor` / `repair` / `direct`).
 
-import { app, Menu, Tray, Notification, nativeImage, shell, dialog, clipboard } from "electron";
+import { app, Menu, Tray, Notification, nativeImage, shell, dialog, clipboard, ipcMain } from "electron";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { claudeStartedAt, reopenClaude } from "./claude-desktop";
+import { readUpdateSeen, rememberUpdate, updateNotice, type RouterUpdate, type UpdateSeen } from "./update-model";
+import { handleScheme, ORIGIN, registerScheme } from "./protocol";
+import { parseJsonOutput, repairDetails, restartStillOwed, shouldNotifyDown, tailLines, trayState, type Action, type ActionResult, type AppState, type Busy, type DirectOutput, type Doctor, type RepairOutput } from "./status-model";
+import { mainWindow, openWindow, sendToWindow, windowVisible, type Bounds } from "./window";
 
 type QuotaWindow = { used_percent?: number; window_minutes?: number };
 type Quota = { rate_limits?: { primary?: QuotaWindow | null; secondary?: QuotaWindow | null } };
 
 type Status = {
   version: string;
+  autoUpdate?: RouterUpdate;
   /** Reported from 0.1.2 on; an older router leaves it out. */
   runtime?: { node: string; router: string | null; startedAt: string };
   /** Reported from 0.1.2 on: whether requests can actually go through, and what is in the way. */
@@ -90,12 +102,17 @@ const STRINGS = {
     proxyLine: (host: string, port: number, slots: string, flight: string) => `Proxy ${host}:${port} · ${slots} · ${flight}`,
     startAtLogin: "Start at login",
     downNotifyTitle: "Claude Desktop cannot connect",
-    downNotifyBody: "The ClaudeRipple router is not running, so Claude Desktop has no way out. Click to start it.",
     starting: "starting the router…",
-    openDashboard: "Open Dashboard in Browser…",
-    offlineHeading: "The router is not running",
-    offlineBody:
-      "Claude Desktop sends all of its traffic through ClaudeRipple, so while the router is down the app shows a blank window with ERR_PROXY_CONNECTION_FAILED. Start the router and reload Claude Desktop.",
+    open: "Open ClaudeRipple…",
+    directHeadline: "Claude's default connection (Ripple off)",
+    tooltipDirect: "ClaudeRipple: using Claude's default connection",
+    notifyDownTitle: "Ripple is not responding",
+    notifyDownBody: "Claude cannot reach AI right now. Repair Ripple, or switch to Claude's default connection.",
+    actRepair: "Repair",
+    actDirectOn: "Use Claude's default connection",
+    restartConfirm: "Quit and reopen the Claude app?",
+    restartConfirmDetail: "Open conversations and any work in progress in the Claude app will stop.",
+    restartNow: "Reopen",
     setupNeeded: "setup not finished",
     setupNeededDetail: "ClaudeRipple is installed but not set up yet",
     runSetup: "Finish setting up ClaudeRipple…",
@@ -111,6 +128,8 @@ const STRINGS = {
     updateNow: "Update",
     later: "Later",
     updating: (v: string) => `Updating to ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Updated to ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `New version ${v} — click to update`,
     updateDone: (v: string) => `Updated to ClaudeRipple ${v}`,
     updateFailed: "The update did not finish",
     updateCheckFailed: "Could not check for updates",
@@ -120,81 +139,432 @@ const STRINGS = {
   ko: {
     healthy: "정상",
     attentionNeeded: "확인 필요",
-    routerNotRunning: "라우터가 꺼져 있음",
-    slotsMapped: (n: number) => `슬롯 ${n}개 매핑`,
+    routerNotRunning: "리플 꺼짐",
+    slotsMapped: (n: number) => `슬롯 ${n}개 연결`,
     inFlight: "진행 중",
     connected: "Claude Desktop 연결됨",
     notConnected: "Claude Desktop 연결 안 됨",
-    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} 주간 ${percent}%`,
+    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} 이번 주 ${percent}% 사용`,
     cliVersion: (v: string) => `Claude Code CLI ${v}`,
-    restartRouter: "라우터 재시작",
-    startRouter: "라우터 시작",
-    pickerOn: "Code 탭 피커에 GPT 모델 이름 표시…",
-    pickerOff: "피커의 GPT 모델 표시 끄기…",
-    pickerState: (on: boolean): string => (on ? "피커: GPT 모델을 실명으로 표시 중 ✓" : "피커: Claude 이름으로 GPT 사용(별칭 모드)"),
-    pickerOnConfirm: "ClaudeRipple 인증서를 신뢰하기 위해 macOS가 로그인 암호를 묻습니다(ClaudeRipple은 암호를 보지 않습니다). 끝나면 Claude Desktop을 완전히 종료했다가 다시 여세요.",
-    pickerDone: "완료. 이제 Claude Desktop을 완전히 종료한 뒤 다시 열고 Code 탭 피커를 확인하세요.",
-    pickerOffDone: "완료. Claude Desktop을 종료했다가 다시 열면 적용됩니다.",
+    restartRouter: "리플 재시작",
+    startRouter: "리플 시작",
+    pickerOn: "Code 탭 피커에 GPT 모델 표시…",
+    pickerOff: "피커에서 GPT 모델 숨기기…",
+    pickerState: (on: boolean): string => (on ? "피커: GPT 모델 이름 표시 중 ✓" : "피커: Claude 이름으로 GPT 사용 (별칭 모드)"),
+    pickerOnConfirm: "ClaudeRipple 인증서를 신뢰하려면 macOS 로그인 암호를 입력해야 합니다(ClaudeRipple은 암호를 보지 않습니다). 완료 후 Claude Desktop을 완전히 종료했다가 다시 열어 주십시오.",
+    pickerDone: "완료되었습니다. Claude Desktop을 완전히 종료했다가 다시 연 뒤 Code 탭 피커를 확인해 주십시오.",
+    pickerOffDone: "완료되었습니다. Claude Desktop을 완전히 종료했다가 다시 열면 적용됩니다.",
     cancel: "취소",
     agentTitleOn: "서브에이전트에 모델 이름 표시",
-    agentTitleOff: "서브에이전트 모델 이름 표시 끄기",
-    agentTitleDone: (on: boolean): string => (on ? "켰습니다. 새로 뜨는 서브에이전트 제목이 \"Terra·high · …\"처럼 보입니다." : "껐습니다."),
+    agentTitleOff: "서브에이전트 모델 이름 숨기기",
+    agentTitleDone: (on: boolean): string => (on ? "켰습니다. 새로 시작하는 서브에이전트 제목이 \"Terra·high · …\"처럼 표시됩니다." : "껐습니다."),
     signInChatgpt: "ChatGPT 로그인…",
     connectClaudeSubscription: "Claude 구독 연결…",
     copyStatus: "상태 복사",
     showLogs: "로그 보기",
     rerunSetup: "ClaudeRipple 설정 다시 실행…",
-    setupTitle: "ClaudeRipple을 설정합니다",
-    setupPrompt: "로컬 인증서 생성, Claude Code 설정(~/.claude/settings.json) 연결, 백그라운드 라우터 등록을 진행합니다. 계속할까요?",
+    setupTitle: "ClaudeRipple 설정",
+    setupPrompt: "로컬 인증서를 만들고, Claude Code 설정(~/.claude/settings.json)을 연결하고, 리플이 백그라운드에서 돌도록 등록합니다. 계속하시겠습니까?",
     setupLater: "나중에",
     setupContinue: "계속",
     setupDone: "ClaudeRipple 설정이 완료되었습니다.",
-    setupFailed: "설정을 마치지 못했습니다",
+    setupFailed: "ClaudeRipple 설정을 완료하지 못했습니다",
     updatedTitle: (v: string) => `ClaudeRipple ${v}`,
-    updatedRestarting: (from: string) => `지금 떠 있는 라우터는 ${from}입니다. 이 버전으로 바꿉니다…`,
-    updatedFailed: "라우터를 이 버전으로 바꾸지 못했습니다",
+    updatedRestarting: (from: string) => `현재 실행 중인 리플은 ${from} 버전입니다. 새 버전으로 전환합니다…`,
+    updatedFailed: "리플을 새 버전으로 전환하지 못했습니다",
     problem: (code: string) =>
-      code === "settings" ? "Claude Code가 ClaudeRipple을 거치지 않음"
-      : code === "upstream" ? "Anthropic에 연결 안 됨"
-      : code === "picker-ca" ? "피커 모드: 인증서 미신뢰"
-      : code === "picker-proxy" ? "피커 모드: Claude Desktop 프록시 미설정"
+      code === "settings" ? "Claude Code가 ClaudeRipple에 연결되지 않음"
+      : code === "upstream" ? "Anthropic 연결 안 됨"
+      : code === "picker-ca" ? "피커 모드: 인증서 신뢰 필요"
+      : code === "picker-proxy" ? "피커 모드: Claude Desktop 프록시 설정 필요"
       : code.startsWith("provider:") ? `프로바이더 ${code.slice(9)} 연결 안 됨`
       : code,
     about: "ClaudeRipple 정보",
     aboutDetail:
-      "Claude Desktop을 끄지 않고 그 안에서 GPT 등 다른 모델을 씁니다.\n\n독립 오픈소스 프로젝트(GPL-3.0)이며 Anthropic·OpenAI와 제휴·보증·후원 관계가 없습니다. Claude와 Claude Code는 Anthropic, PBC의 상표입니다.",
+      "Claude Desktop을 끄지 않고 그 안에서 GPT 등 다양한 모델을 함께 씁니다.\n\n독립 오픈소스 프로젝트(GPL-3.0)이며 Anthropic·OpenAI와 제휴·보증·후원 관계가 없습니다. Claude와 Claude Code는 Anthropic, PBC의 상표입니다.",
     quit: "종료",
     tooltip: (state: string) => `ClaudeRipple ${state}`,
-    tooltipDown: "ClaudeRipple: 라우터가 꺼져 있어 Claude Desktop이 연결되지 않습니다",
+    tooltipDown: "ClaudeRipple: 리플이 꺼져 있어 Claude Desktop이 연결되지 않습니다",
     proxyLine: (host: string, port: number, slots: string, flight: string) => `프록시 ${host}:${port} · ${slots} · ${flight}`,
     startAtLogin: "로그인 시 자동 시작",
     downNotifyTitle: "Claude Desktop이 연결되지 않습니다",
-    downNotifyBody: "ClaudeRipple 라우터가 꺼져 있어 Claude Desktop이 밖으로 나가지 못합니다. 눌러서 시작하세요.",
-    starting: "라우터를 시작하는 중…",
-    openDashboard: "브라우저에서 대시보드 열기…",
-    offlineHeading: "라우터가 꺼져 있습니다",
-    offlineBody:
-      "Claude Desktop은 모든 통신을 ClaudeRipple로 보냅니다. 그래서 라우터가 꺼져 있는 동안에는 앱이 흰 화면과 ERR_PROXY_CONNECTION_FAILED만 보여줍니다. 라우터를 시작한 뒤 Claude Desktop을 새로고침하세요.",
-    setupNeeded: "설정이 끝나지 않았습니다",
-    setupNeededDetail: "설치는 됐지만 아직 설정하지 않았습니다",
-    runSetup: "ClaudeRipple 설정 마치기…",
+    starting: "리플을 시작하는 중…",
+    open: "ClaudeRipple 열기…",
+    directHeadline: "Claude 기본 연결 사용 중 (리플 꺼짐)",
+    tooltipDirect: "ClaudeRipple: Claude 기본 연결 사용 중",
+    notifyDownTitle: "리플이 응답하지 않습니다",
+    notifyDownBody: "지금 Claude가 AI에 연결되지 않습니다. 리플을 복구하거나 Claude 기본 연결로 전환할 수 있습니다.",
+    actRepair: "복구",
+    actDirectOn: "Claude 기본 연결로 전환",
+    restartConfirm: "Claude 앱을 종료했다가 다시 여시겠습니까?",
+    restartConfirmDetail: "Claude 앱의 열린 대화와 진행 중인 작업이 중단됩니다.",
+    restartNow: "다시 열기",
+    setupNeeded: "설정 필요",
+    setupNeededDetail: "ClaudeRipple이 설치되었지만 아직 설정이 완료되지 않았습니다.",
+    runSetup: "ClaudeRipple 설정 완료하기…",
     claudeCurrent: "현재 로그인",
     claudeUsage: (label: string, windows: string) => `Claude ${label} · ${windows}`,
     window5h: "5시간",
     windowWeek: "주간",
     checkUpdates: "업데이트 확인…",
-    updateAvailableItem: (v: string) => `새 버전 업데이트: ClaudeRipple ${v}…`,
-    upToDate: (v: string) => `최신 버전입니다: ClaudeRipple ${v}`,
-    updateAvailable: (latest: string, current: string) => `새 버전이 나왔습니다: ClaudeRipple ${latest} (지금 ${current})`,
-    updateDetail: "진행 중인 요청이 끝나면 라우터가 새 버전으로 다시 시작합니다. 트레이는 저절로 다시 열립니다.",
+    updateAvailableItem: (v: string) => `ClaudeRipple ${v} 버전으로 업데이트…`,
+    upToDate: (v: string) => `최신 버전입니다 (ClaudeRipple ${v})`,
+    updateAvailable: (latest: string, current: string) => `새 버전이 나왔습니다: ClaudeRipple ${latest} (현재 ${current})`,
+    updateDetail: "진행 중인 요청이 끝나면 리플이 새 버전으로 다시 시작됩니다. 트레이 메뉴는 자동으로 다시 열립니다.",
     updateNow: "업데이트",
     later: "나중에",
     updating: (v: string) => `ClaudeRipple ${v} 업데이트 중…`,
+    autoUpdated: (v: string) => `ClaudeRipple ${v}로 업데이트됨`,
+    autoAvailable: (v: string) => `새 버전 ${v} — 클릭해서 업데이트`,
     updateDone: (v: string) => `ClaudeRipple ${v} 업데이트 완료`,
-    updateFailed: "업데이트를 마치지 못했습니다",
-    updateCheckFailed: "업데이트를 확인하지 못했습니다",
-    updatePackaged: "독립 실행 앱입니다. 릴리스 페이지에서 새 버전을 받으세요.",
-    updateCheckout: "소스 체크아웃입니다. git pull로 업데이트하세요.",
+    updateFailed: "업데이트를 완료하지 못했습니다",
+    updateCheckFailed: "업데이트 정보를 확인하지 못했습니다",
+    updatePackaged: "설치형 앱입니다. 릴리스 페이지에서 최신 버전을 다운로드해 주십시오.",
+    updateCheckout: "소스 코드로 실행 중입니다. git pull 명령으로 업데이트해 주십시오.",
+  },
+  zh: {
+    healthy: "运行正常",
+    attentionNeeded: "需要处理",
+    routerNotRunning: "路由服务未运行",
+    slotsMapped: (n: number) => `已映射 ${n} 个槽位`,
+    inFlight: "进行中",
+    connected: "Claude Desktop 已连接",
+    notConnected: "Claude Desktop 未连接",
+    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} 本周已用 ${percent}%`,
+    cliVersion: (v: string) => `Claude Code CLI ${v}`,
+    restartRouter: "重启路由服务",
+    startRouter: "启动路由服务",
+    pickerOn: "在 Code 标签页的模型选择器中显示 GPT 模型…",
+    pickerOff: "不再在模型选择器中显示 GPT 模型…",
+    pickerState: (on: boolean): string => (on ? "模型选择器：以真实名称显示 GPT 模型 ✓" : "模型选择器：通过 Claude 模型名使用 GPT 模型（别名模式）"),
+    pickerOnConfirm: "macOS 会要求输入登录密码以信任 ClaudeRipple 证书（ClaudeRipple 永远不会看到密码）。之后请退出并重新打开 Claude Desktop。",
+    pickerDone: "完成。现在请完全退出 Claude Desktop 再重新打开，然后查看 Code 标签页的模型选择器。",
+    pickerOffDone: "完成。退出并重新打开 Claude Desktop 后生效。",
+    cancel: "取消",
+    agentTitleOn: "在子代理上显示模型名称",
+    agentTitleOff: "不再在子代理上显示模型名称",
+    agentTitleDone: (on: boolean): string => (on ? "已开启。新的子代理标题将类似于“Terra·high · …”。" : "已关闭。"),
+    signInChatgpt: "登录 ChatGPT…",
+    connectClaudeSubscription: "连接 Claude 订阅…",
+    copyStatus: "复制状态",
+    showLogs: "查看日志",
+    rerunSetup: "重新运行 ClaudeRipple 设置…",
+    setupTitle: "设置 ClaudeRipple",
+    setupPrompt: "ClaudeRipple 将创建本地证书、配置 Claude Code 以连接 ClaudeRipple（~/.claude/settings.json），并注册后台路由服务。是否继续？",
+    setupLater: "稍后",
+    setupContinue: "继续",
+    setupDone: "ClaudeRipple 设置完成。",
+    setupFailed: "设置未完成",
+    updatedTitle: (v: string) => `ClaudeRipple ${v}`,
+    updatedRestarting: (from: string) => `正在运行的路由服务版本为 ${from}，正在切换到当前版本…`,
+    updatedFailed: "无法将路由服务切换到当前版本",
+    problem: (code: string) =>
+      code === "settings" ? "Claude Code 未指向 ClaudeRipple"
+      : code === "upstream" ? "无法连接 Anthropic"
+      : code === "picker-ca" ? "选择器模式：证书未被信任"
+      : code === "picker-proxy" ? "选择器模式：未设置 Claude Desktop 代理"
+      : code.startsWith("provider:") ? `无法连接供应商 ${code.slice(9)}`
+      : code,
+    about: "关于 ClaudeRipple",
+    aboutDetail:
+      "在 Claude Desktop 中运行 GPT 和其他模型，无需关闭 Claude。\n\n独立开源项目（GPL-3.0）。与 Anthropic 和 OpenAI 均无关联，未获其认可或赞助。Claude 和 Claude Code 是 Anthropic, PBC 的商标。",
+    quit: "退出",
+    tooltip: (state: string) => `ClaudeRipple ${state}`,
+    tooltipDown: "ClaudeRipple：路由服务未运行 — Claude Desktop 无法连接",
+    proxyLine: (host: string, port: number, slots: string, flight: string) => `代理 ${host}:${port} · ${slots} · ${flight}`,
+    startAtLogin: "登录时启动",
+    downNotifyTitle: "Claude Desktop 无法连接",
+    starting: "正在启动路由服务…",
+    open: "打开 ClaudeRipple…",
+    directHeadline: "正在使用 Claude 默认连接（Ripple 已关闭）",
+    tooltipDirect: "ClaudeRipple：正在使用 Claude 默认连接",
+    notifyDownTitle: "Ripple 没有响应",
+    notifyDownBody: "Claude 现在无法连接 AI。可以修复 Ripple，或切换到 Claude 默认连接。",
+    actRepair: "修复",
+    actDirectOn: "切换到 Claude 默认连接",
+    restartConfirm: "要退出并重新打开 Claude 应用吗？",
+    restartConfirmDetail: "Claude 应用中打开的对话和进行中的工作会停止。",
+    restartNow: "重新打开",
+    setupNeeded: "设置未完成",
+    setupNeededDetail: "ClaudeRipple 已安装，但尚未完成设置",
+    runSetup: "完成 ClaudeRipple 设置…",
+    claudeCurrent: "当前登录",
+    claudeUsage: (label: string, windows: string) => `Claude ${label} · ${windows}`,
+    window5h: "5 小时",
+    windowWeek: "每周",
+    checkUpdates: "检查更新…",
+    updateAvailableItem: (v: string) => `更新到 ClaudeRipple ${v}…`,
+    upToDate: (v: string) => `ClaudeRipple ${v} 已是最新版本。`,
+    updateAvailable: (latest: string, current: string) => `ClaudeRipple ${latest} 已发布（当前版本 ${current}）。`,
+    updateDetail: "进行中的请求处理完毕后，路由服务会以新版本重启。托盘应用会自动重新打开。",
+    updateNow: "更新",
+    later: "稍后",
+    updating: (v: string) => `正在更新到 ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `已更新到 ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `新版本 ${v} — 点击更新`,
+    updateDone: (v: string) => `已更新到 ClaudeRipple ${v}`,
+    updateFailed: "更新未完成",
+    updateCheckFailed: "无法检查更新",
+    updatePackaged: "这是独立打包的应用。请从发布页面下载新版本。",
+    updateCheckout: "这是从仓库检出的源码版本，请用 git pull 更新。",
+  },
+  ja: {
+    healthy: "正常",
+    attentionNeeded: "要確認",
+    routerNotRunning: "ルーター停止中",
+    slotsMapped: (n: number) => `${n}個のスロットをマッピング済み`,
+    inFlight: "処理中",
+    connected: "Claude Desktop 接続済み",
+    notConnected: "Claude Desktop 未接続",
+    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} 今週 ${percent}% 使用`,
+    cliVersion: (v: string) => `Claude Code CLI ${v}`,
+    restartRouter: "ルーターを再起動",
+    startRouter: "ルーターを起動",
+    pickerOn: "CodeタブのピッカーにGPTモデルを表示…",
+    pickerOff: "ピッカーのGPTモデルを非表示にする…",
+    pickerState: (on: boolean): string => (on ? "ピッカー：GPTモデルを実際の名前で表示 ✓" : "ピッカー：Claudeの名前経由でGPTモデルを使用（エイリアスモード）"),
+    pickerOnConfirm: "ClaudeRippleの証明書を信頼するため、macOSがログインパスワードを求めます（ClaudeRippleがパスワードを見ることはありません）。その後、Claude Desktopを終了して開き直してください。",
+    pickerDone: "完了しました。Claude Desktopを完全に終了してから開き直し、Codeタブのピッカーを確認してください。",
+    pickerOffDone: "完了しました。反映するには、Claude Desktopを終了して開き直してください。",
+    cancel: "キャンセル",
+    agentTitleOn: "サブエージェントにモデル名を表示",
+    agentTitleOff: "サブエージェントのモデル名を非表示にする",
+    agentTitleDone: (on: boolean): string => (on ? "オンにしました。新しいサブエージェントには「Terra·high · …」のようなタイトルが付きます。" : "オフにしました。"),
+    signInChatgpt: "ChatGPTにログイン…",
+    connectClaudeSubscription: "Claudeサブスクリプションを接続…",
+    copyStatus: "ステータスをコピー",
+    showLogs: "ログを表示",
+    rerunSetup: "ClaudeRippleのセットアップを再実行…",
+    setupTitle: "ClaudeRippleのセットアップ",
+    setupPrompt: "ClaudeRippleがローカル証明書を作成し、Claude Codeの接続設定（~/.claude/settings.json）を行い、バックグラウンドのルーターを登録します。続けますか？",
+    setupLater: "後で",
+    setupContinue: "続ける",
+    setupDone: "ClaudeRippleのセットアップが完了しました。",
+    setupFailed: "セットアップが完了しませんでした",
+    updatedTitle: (v: string) => `ClaudeRipple ${v}`,
+    updatedRestarting: (from: string) => `実行中のルーターは ${from} です。このバージョンに切り替えています…`,
+    updatedFailed: "ルーターをこのバージョンに切り替えられませんでした",
+    problem: (code: string) =>
+      code === "settings" ? "Claude Codeの接続先がClaudeRippleになっていません"
+      : code === "upstream" ? "Anthropicに接続できません"
+      : code === "picker-ca" ? "ピッカーモード：証明書が信頼されていません"
+      : code === "picker-proxy" ? "ピッカーモード：Claude Desktopのプロキシが未設定です"
+      : code.startsWith("provider:") ? `プロバイダー ${code.slice(9)} に接続できません`
+      : code,
+    about: "ClaudeRippleについて",
+    aboutDetail:
+      "Claudeをオフにすることなく、Claude Desktopの中でGPTなどのモデルを動かします。\n\n独立したオープンソースプロジェクトです（GPL-3.0）。AnthropicおよびOpenAIとは提携関係になく、両社による承認や後援も受けていません。ClaudeおよびClaude Codeは、Anthropic, PBCの商標です。",
+    quit: "終了",
+    tooltip: (state: string) => `ClaudeRipple ${state}`,
+    tooltipDown: "ClaudeRipple：ルーター停止中 — Claude Desktopは接続できません",
+    proxyLine: (host: string, port: number, slots: string, flight: string) => `プロキシ ${host}:${port} · ${slots} · ${flight}`,
+    startAtLogin: "ログイン時に起動",
+    downNotifyTitle: "Claude Desktopが接続できません",
+    starting: "ルーターを起動中…",
+    open: "ClaudeRippleを開く…",
+    directHeadline: "Claude の標準接続を使用中（Ripple はオフ）",
+    tooltipDirect: "ClaudeRipple：Claude の標準接続を使用中",
+    notifyDownTitle: "Ripple が応答しません",
+    notifyDownBody: "現在 Claude は AI に接続できません。Ripple を修復するか、Claude の標準接続に切り替えられます。",
+    actRepair: "修復",
+    actDirectOn: "Claude の標準接続に切り替え",
+    restartConfirm: "Claude アプリを終了して開き直しますか？",
+    restartConfirmDetail: "Claude アプリで開いている会話や進行中の作業は止まります。",
+    restartNow: "開き直す",
+    setupNeeded: "セットアップ未完了",
+    setupNeededDetail: "ClaudeRippleはインストール済みですが、まだセットアップされていません",
+    runSetup: "ClaudeRippleのセットアップを完了…",
+    claudeCurrent: "現在のログイン",
+    claudeUsage: (label: string, windows: string) => `Claude ${label} · ${windows}`,
+    window5h: "5時間",
+    windowWeek: "週間",
+    checkUpdates: "アップデートを確認…",
+    updateAvailableItem: (v: string) => `ClaudeRipple ${v} にアップデート…`,
+    upToDate: (v: string) => `ClaudeRipple ${v} は最新バージョンです。`,
+    updateAvailable: (latest: string, current: string) => `ClaudeRipple ${latest} が利用可能です（現在のバージョン：${current}）。`,
+    updateDetail: "処理中のリクエストが終わり次第、ルーターは新しいバージョンで再起動します。トレイアプリは自動で再起動します。",
+    updateNow: "アップデート",
+    later: "後で",
+    updating: (v: string) => `ClaudeRipple ${v} にアップデート中…`,
+    autoUpdated: (v: string) => `ClaudeRipple ${v} にアップデートしました`,
+    autoAvailable: (v: string) => `新バージョン ${v} — クリックして更新`,
+    updateDone: (v: string) => `ClaudeRipple ${v} にアップデートしました`,
+    updateFailed: "アップデートが完了しませんでした",
+    updateCheckFailed: "アップデートを確認できませんでした",
+    updatePackaged: "これはスタンドアロン版のアプリです。リリースページから新しいバージョンをダウンロードしてください。",
+    updateCheckout: "これはソースから実行している環境です。git pullで更新してください。",
+  },
+  es: {
+    healthy: "en buen estado",
+    attentionNeeded: "requiere atención",
+    routerNotRunning: "router detenido",
+    slotsMapped: (n: number) => `${n} ${n === 1 ? "slot asignado" : "slots asignados"}`,
+    inFlight: "en curso",
+    connected: "Claude Desktop conectado",
+    notConnected: "Claude Desktop no conectado",
+    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} ${percent}% esta semana`,
+    cliVersion: (v: string) => `Claude Code CLI ${v}`,
+    restartRouter: "Reiniciar router",
+    startRouter: "Iniciar router",
+    pickerOn: "Mostrar modelos GPT en el selector de la pestaña Code…",
+    pickerOff: "Dejar de mostrar modelos GPT en el selector…",
+    pickerState: (on: boolean): string => (on ? "Selector: modelos GPT con su nombre ✓" : "Selector: modelos GPT bajo nombres de Claude (modo alias)"),
+    pickerOnConfirm: "macOS te pedirá tu contraseña de inicio de sesión para confiar en el certificado de ClaudeRipple (ClaudeRipple nunca la ve). Después, cierra Claude Desktop por completo y vuelve a abrirlo.",
+    pickerDone: "Listo. Ahora cierra Claude Desktop por completo, vuelve a abrirlo y revisa el selector de la pestaña Code.",
+    pickerOffDone: "Listo. Cierra Claude Desktop por completo y vuelve a abrirlo para aplicarlo.",
+    cancel: "Cancelar",
+    agentTitleOn: "Mostrar nombres de modelo en los subagentes",
+    agentTitleOff: "Dejar de mostrar nombres de modelo en los subagentes",
+    agentTitleDone: (on: boolean): string => (on ? "Activado. Los subagentes nuevos tendrán títulos como \"Terra·high · …\"." : "Desactivado."),
+    signInChatgpt: "Iniciar sesión en ChatGPT…",
+    connectClaudeSubscription: "Conectar suscripción de Claude…",
+    copyStatus: "Copiar estado",
+    showLogs: "Mostrar registros",
+    rerunSetup: "Volver a ejecutar la configuración de ClaudeRipple…",
+    setupTitle: "Configurar ClaudeRipple",
+    setupPrompt: "ClaudeRipple creará un certificado local, conectará la configuración de Claude Code (~/.claude/settings.json) y registrará el router en segundo plano. ¿Continuar?",
+    setupLater: "Más tarde",
+    setupContinue: "Continuar",
+    setupDone: "Configuración de ClaudeRipple completada.",
+    setupFailed: "La configuración no se completó",
+    updatedTitle: (v: string) => `ClaudeRipple ${v}`,
+    updatedRestarting: (from: string) => `El router en ejecución está en la versión ${from}. Cambiándolo a esta versión…`,
+    updatedFailed: "No se pudo cambiar el router a esta versión",
+    problem: (code: string) =>
+      code === "settings" ? "Claude Code no apunta a ClaudeRipple"
+      : code === "upstream" ? "No se puede acceder a Anthropic"
+      : code === "picker-ca" ? "modo selector: el certificado no es de confianza"
+      : code === "picker-proxy" ? "modo selector: proxy de Claude Desktop sin configurar"
+      : code.startsWith("provider:") ? `no se puede acceder al proveedor ${code.slice(9)}`
+      : code,
+    about: "Acerca de ClaudeRipple",
+    aboutDetail:
+      "Usa GPT y otros modelos dentro de Claude Desktop sin desactivar Claude.\n\nProyecto independiente de código abierto (GPL-3.0). No está afiliado a Anthropic ni a OpenAI, ni cuenta con su respaldo ni con su patrocinio. Claude y Claude Code son marcas comerciales de Anthropic, PBC.",
+    quit: "Salir",
+    tooltip: (state: string) => `ClaudeRipple ${state}`,
+    tooltipDown: "ClaudeRipple: router detenido — Claude Desktop no puede conectarse",
+    proxyLine: (host: string, port: number, slots: string, flight: string) => `Proxy ${host}:${port} · ${slots} · ${flight}`,
+    startAtLogin: "Abrir al iniciar sesión",
+    downNotifyTitle: "Claude Desktop no puede conectarse",
+    starting: "iniciando el router…",
+    open: "Abrir ClaudeRipple…",
+    directHeadline: "Conexión predeterminada de Claude (Ripple apagado)",
+    tooltipDirect: "ClaudeRipple: usando la conexión predeterminada de Claude",
+    notifyDownTitle: "Ripple no responde",
+    notifyDownBody: "Claude no puede conectarse a la IA ahora mismo. Repara Ripple o usa la conexión predeterminada de Claude.",
+    actRepair: "Reparar",
+    actDirectOn: "Usar la conexión predeterminada de Claude",
+    restartConfirm: "¿Cerrar y volver a abrir la app de Claude?",
+    restartConfirmDetail: "Las conversaciones abiertas y el trabajo en curso en la app de Claude se detendrán.",
+    restartNow: "Reabrir",
+    setupNeeded: "configuración pendiente",
+    setupNeededDetail: "ClaudeRipple está instalado, pero aún no está configurado",
+    runSetup: "Terminar de configurar ClaudeRipple…",
+    claudeCurrent: "sesión actual",
+    claudeUsage: (label: string, windows: string) => `Claude ${label} · ${windows}`,
+    window5h: "5 h",
+    windowWeek: "semanal",
+    checkUpdates: "Buscar actualizaciones…",
+    updateAvailableItem: (v: string) => `Actualizar a ClaudeRipple ${v}…`,
+    upToDate: (v: string) => `ClaudeRipple ${v} es la última versión.`,
+    updateAvailable: (latest: string, current: string) => `ClaudeRipple ${latest} está disponible (tienes la ${current}).`,
+    updateDetail: "El router se reinicia con la nueva versión cuando terminan las solicitudes en curso. La app de la bandeja se vuelve a abrir sola.",
+    updateNow: "Actualizar",
+    later: "Más tarde",
+    updating: (v: string) => `Actualizando a ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Actualizado a ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `Nueva versión ${v} — haz clic para actualizar`,
+    updateDone: (v: string) => `Actualizado a ClaudeRipple ${v}`,
+    updateFailed: "La actualización no se completó",
+    updateCheckFailed: "No se pudo comprobar si hay actualizaciones",
+    updatePackaged: "Esta es la app independiente. Descarga la nueva versión desde la página de versiones.",
+    updateCheckout: "Esta es una copia del código fuente. Actualízala con git pull.",
+  },
+  pt: {
+    healthy: "funcionando",
+    attentionNeeded: "requer atenção",
+    routerNotRunning: "roteador parado",
+    slotsMapped: (n: number) => `${n} slot${n === 1 ? "" : "s"} mapeado${n === 1 ? "" : "s"}`,
+    inFlight: "em andamento",
+    connected: "Claude Desktop conectado",
+    notConnected: "Claude Desktop não conectado",
+    percentOfWeekUsed: (percent: string | number, plan: string) => `ChatGPT ${plan} ${percent}% nesta semana`,
+    cliVersion: (v: string) => `Claude Code CLI ${v}`,
+    restartRouter: "Reiniciar roteador",
+    startRouter: "Iniciar roteador",
+    pickerOn: "Mostrar modelos GPT no seletor da aba Code…",
+    pickerOff: "Parar de mostrar modelos GPT no seletor…",
+    pickerState: (on: boolean): string => (on ? "Seletor: modelos GPT exibidos pelo nome ✓" : "Seletor: modelos GPT via nomes do Claude (modo alias)"),
+    pickerOnConfirm: "O macOS vai pedir sua senha de login para confiar no certificado do ClaudeRipple (o ClaudeRipple nunca a vê). Depois, encerre o Claude Desktop e abra-o de novo.",
+    pickerDone: "Pronto. Agora encerre o Claude Desktop por completo, abra-o de novo e confira o seletor da aba Code.",
+    pickerOffDone: "Pronto. Encerre o Claude Desktop e abra-o de novo para aplicar.",
+    cancel: "Cancelar",
+    agentTitleOn: "Mostrar nomes de modelo nos subagentes",
+    agentTitleOff: "Parar de mostrar nomes de modelo nos subagentes",
+    agentTitleDone: (on: boolean): string => (on ? "Ativado. Novos subagentes terão títulos como \"Terra·high · …\"." : "Desativado."),
+    signInChatgpt: "Entrar no ChatGPT…",
+    connectClaudeSubscription: "Conectar assinatura do Claude…",
+    copyStatus: "Copiar status",
+    showLogs: "Mostrar logs",
+    rerunSetup: "Configurar o ClaudeRipple novamente…",
+    setupTitle: "Configurar o ClaudeRipple",
+    setupPrompt: "O ClaudeRipple vai criar um certificado local, conectar as configurações do Claude Code (~/.claude/settings.json) e registrar o roteador em segundo plano. Continuar?",
+    setupLater: "Depois",
+    setupContinue: "Continuar",
+    setupDone: "Configuração do ClaudeRipple concluída.",
+    setupFailed: "A configuração não foi concluída",
+    updatedTitle: (v: string) => `ClaudeRipple ${v}`,
+    updatedRestarting: (from: string) => `O roteador em execução está na versão ${from}. Mudando para esta versão…`,
+    updatedFailed: "Não foi possível mudar o roteador para esta versão",
+    problem: (code: string) =>
+      code === "settings" ? "O Claude Code não está configurado para usar o ClaudeRipple"
+      : code === "upstream" ? "A Anthropic está inacessível"
+      : code === "picker-ca" ? "modo seletor: certificado não confiável"
+      : code === "picker-proxy" ? "modo seletor: proxy do Claude Desktop não configurado"
+      : code.startsWith("provider:") ? `provedor ${code.slice(9)} inacessível`
+      : code,
+    about: "Sobre o ClaudeRipple",
+    aboutDetail:
+      "Rode o GPT e outros modelos dentro do Claude Desktop, sem desligar o Claude.\n\nProjeto open source independente (GPL-3.0). Não tem afiliação com a Anthropic nem com a OpenAI, nem é endossado ou patrocinado por nenhuma delas. Claude e Claude Code são marcas comerciais da Anthropic, PBC.",
+    quit: "Sair",
+    tooltip: (state: string) => `ClaudeRipple ${state}`,
+    tooltipDown: "ClaudeRipple: roteador parado — o Claude Desktop não consegue se conectar",
+    proxyLine: (host: string, port: number, slots: string, flight: string) => `Proxy ${host}:${port} · ${slots} · ${flight}`,
+    startAtLogin: "Iniciar ao fazer login",
+    downNotifyTitle: "O Claude Desktop não consegue se conectar",
+    starting: "iniciando o roteador…",
+    open: "Abrir o ClaudeRipple…",
+    directHeadline: "Conexão padrão do Claude (Ripple desligado)",
+    tooltipDirect: "ClaudeRipple: usando a conexão padrão do Claude",
+    notifyDownTitle: "O Ripple não está respondendo",
+    notifyDownBody: "O Claude não consegue acessar a IA agora. Repare o Ripple ou use a conexão padrão do Claude.",
+    actRepair: "Reparar",
+    actDirectOn: "Usar a conexão padrão do Claude",
+    restartConfirm: "Encerrar e reabrir o app do Claude?",
+    restartConfirmDetail: "As conversas abertas e o trabalho em andamento no app do Claude vão parar.",
+    restartNow: "Reabrir",
+    setupNeeded: "configuração não concluída",
+    setupNeededDetail: "O ClaudeRipple está instalado, mas ainda não foi configurado",
+    runSetup: "Concluir a configuração do ClaudeRipple…",
+    claudeCurrent: "login atual",
+    claudeUsage: (label: string, windows: string) => `Claude ${label} · ${windows}`,
+    window5h: "5h",
+    windowWeek: "semanal",
+    checkUpdates: "Verificar atualizações…",
+    updateAvailableItem: (v: string) => `Atualizar para o ClaudeRipple ${v}…`,
+    upToDate: (v: string) => `O ClaudeRipple ${v} é a versão mais recente.`,
+    updateAvailable: (latest: string, current: string) => `O ClaudeRipple ${latest} está disponível (você tem a ${current}).`,
+    updateDetail: "O roteador reinicia na nova versão assim que as requisições em andamento terminarem. O app da bandeja reabre sozinho.",
+    updateNow: "Atualizar",
+    later: "Depois",
+    updating: (v: string) => `Atualizando para o ClaudeRipple ${v}…`,
+    autoUpdated: (v: string) => `Atualizado para o ClaudeRipple ${v}`,
+    autoAvailable: (v: string) => `Nova versão ${v} — clique para atualizar`,
+    updateDone: (v: string) => `Atualizado para o ClaudeRipple ${v}`,
+    updateFailed: "A atualização não foi concluída",
+    updateCheckFailed: "Não foi possível verificar atualizações",
+    updatePackaged: "Este é o app independente. Baixe a nova versão na página de releases.",
+    updateCheckout: "Isto é um checkout do código-fonte. Atualize com git pull.",
   },
 };
 
@@ -216,6 +586,8 @@ let lastError: string | null = null;
 let starting = false;
 let downSince: number | null = null;
 let downNotified = false;
+/** Whether the last health poll got an answer; null before the first poll. */
+let answered: boolean | null = null;
 // Long enough that a router still coming up after login does not fire a notification.
 const DOWN_NOTIFY_AFTER_MS = 20_000;
 
@@ -225,9 +597,11 @@ const DOWN_NOTIFY_AFTER_MS = 20_000;
 
 const stateFile = path.join(home, "app.json");
 
-function appState(): { loginItemInitialized?: boolean } {
+type SavedAppState = { loginItemInitialized?: boolean; window?: Bounds };
+
+function appState(): SavedAppState {
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8")) as { loginItemInitialized?: boolean };
+    return JSON.parse(fs.readFileSync(stateFile, "utf8")) as SavedAppState;
   } catch {
     return {};
   }
@@ -242,9 +616,19 @@ function writeAppState(patch: Record<string, unknown>): void {
   }
 }
 
+/**
+ * How Windows starts this tray at login. A packaged app is its own binary. Installed from npm, the
+ * binary is a bare Electron that needs our script after it: registered without one, every logon
+ * opened Electron's default app and no tray (issue #50). macOS ignores `path`/`args`.
+ */
+function loginItemLaunch(): { path: string; args: string[] } | undefined {
+  if (app.isPackaged || process.platform !== "win32" || !process.argv[1]) return undefined;
+  return { path: process.execPath, args: [path.resolve(process.argv[1])] };
+}
+
 function loginItemOn(): boolean {
   try {
-    return app.getLoginItemSettings().openAtLogin;
+    return app.getLoginItemSettings(loginItemLaunch()).openAtLogin;
   } catch {
     return false;
   }
@@ -252,14 +636,22 @@ function loginItemOn(): boolean {
 
 function setLoginItem(on: boolean): void {
   try {
-    app.setLoginItemSettings({ openAtLogin: on });
+    app.setLoginItemSettings({ openAtLogin: on, ...loginItemLaunch() });
   } catch {
     /* macOS may refuse in an unsigned development build */
   }
   writeAppState({ loginItemInitialized: true });
 }
 
+// Overrides for running this app against stand-ins instead of the real installation (tests, and
+// trying a change without touching the router someone depends on):
+//   CLAUDERIPPLE_APP_ADMIN_URL  the admin API base the health poll and the dashboard use
+//   CLAUDERIPPLE_APP_CLI        a CLI script to run instead of the installed one
+//   CLAUDERIPPLE_APP_USER_DATA  Electron's data folder, which also keys the one-tray lock
+// CLAUDERIPPLE_HOME (logs, app.json, config.json) is honoured as everywhere else.
 function adminUrl(): string {
+  const override = process.env.CLAUDERIPPLE_APP_ADMIN_URL;
+  if (override) return override.endsWith("/") ? override : `${override}/`;
   return `http://127.0.0.1:${readConfigPorts().admin}/`;
 }
 
@@ -268,18 +660,16 @@ function adminUrl(): string {
  * reads `en-US` on a Korean Windows (measured 2026-09-14), so the tray, notifications and the GUI
  * came up in English there. macOS happened to agree, which hid it.
  */
-function uiLang(): "ko" | "en" {
+function uiLang(): keyof typeof STRINGS {
   const candidates = [...app.getPreferredSystemLanguages(), app.getSystemLocale(), app.getLocale()];
   const first = candidates.find((l) => typeof l === "string" && l.length > 0) ?? "en";
-  return first.toLowerCase().startsWith("ko") ? "ko" : "en";
-}
-
-/** The GUI follows the OS language by default; a language the user picked in the GUI itself wins (it is stored in the page). */
-function guiUrl(): string {
-  return `${adminUrl()}?lang=${uiLang()}`;
+  // Every Chinese locale gets the Simplified text and every Portuguese one the Brazilian text.
+  const base = first.toLowerCase().split(/[-_]/)[0]!;
+  return base in STRINGS ? (base as keyof typeof STRINGS) : "en";
 }
 
 async function poll(): Promise<void> {
+  const before = answered;
   try {
     const res = await fetch(`${adminUrl()}api/status`, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -287,26 +677,62 @@ async function poll(): Promise<void> {
     lastError = null;
     downSince = null;
     downNotified = false;
+    answered = true;
+    void handleRouterUpdate(last).catch((error: unknown) => console.error(`update notification: ${error}`));
     void reconcileRouter(last);
   } catch (e) {
     last = null;
     lastError = (e as Error).message;
+    answered = false;
     downSince ??= Date.now();
-    // An update restarts the router on purpose; that is not the outage the notification is for.
-    if (!downNotified && !updating && Date.now() - downSince >= DOWN_NOTIFY_AFTER_MS) {
+    // An update or one of the window's own actions restarts the router on purpose; that is not
+    // the outage the notification is for. Neither is the direct mode, where the router being off
+    // is the point — so doctor is asked first, and once per outage. With the window on screen the
+    // user is already looking at the same news.
+    if (shouldNotifyDown({ downForMs: Date.now() - downSince, graceMs: DOWN_NOTIFY_AFTER_MS, alreadyNotified: downNotified, updating: updating || Date.now() < routerUpdateUntil, busy: !!rec.busy || windowVisible(), mode: rec.doctor?.mode ?? null })) {
       downNotified = true;
-      notifyDown();
+      void refreshDoctor().then(() => {
+        if (!last && rec.doctor?.mode !== "direct") notifyDown();
+      });
     }
+  }
+  // Up or down changed: what doctor said about the rest (direct, mixed) may have changed with it.
+  if (before !== null && before !== answered && !rec.busy) void refreshDoctor();
+  // Claude quit or reopened by hand has applied the change as surely as the button would.
+  if (rec.restartClaude && !rec.busy && Date.now() - restartCheckedAt >= RESTART_CHECK_MS) {
+    restartCheckedAt = Date.now();
+    if (!restartStillOwed(restartOwedSince, await claudeStartedAt())) rec.restartClaude = false;
   }
   render();
 }
 
-/** The router being down means Claude Desktop is dead in the water, so say so out loud. */
+// Held so the handlers are not collected with it before the user gets to the notification.
+let downNotification: Notification | null = null;
+
+/** The router being down means Claude is silent, so say so out loud, with the two ways out. */
 function notifyDown(): void {
-  if (!Notification.isSupported()) return;
-  const n = new Notification({ title: L.downNotifyTitle, body: L.downNotifyBody });
-  n.on("click", () => void startRouter());
+  if (!Notification.isSupported()) {
+    // Nothing else would tell the user; the window does.
+    showWindow("health");
+    return;
+  }
+  const n = new Notification({
+    title: L.notifyDownTitle,
+    body: L.notifyDownBody,
+    icon: notifyIcon(),
+    // macOS shows these as buttons on the notification (an Options menu when there are two).
+    actions: [
+      { type: "button", text: L.actRepair },
+      { type: "button", text: L.actDirectOn },
+    ],
+  });
+  n.on("click", () => showWindow("health"));
+  n.on("action", (_event, index) => {
+    showWindow("health");
+    void act(index === 0 ? "repair" : "direct-on");
+  });
   n.show();
+  downNotification = n;
 }
 
 /** Idempotent: `clauderipple start` leaves a router that is already coming up alone. */
@@ -336,34 +762,30 @@ const isMac = process.platform === "darwin";
  * mark would vanish on a dark taskbar — it gets a coloured variant instead, which also lets the
  * state read as a colour rather than only a shape.
  */
-function icon(state: "ok" | "warn" | "down"): Electron.NativeImage {
-  const mac = { ok: "trayTemplate.png", warn: "trayWarnTemplate.png", down: "trayDownTemplate.png" };
-  const win = { ok: "trayWin.png", warn: "trayWinWarn.png", down: "trayWinDown.png" };
+function icon(state: "ok" | "warn" | "down" | "direct"): Electron.NativeImage {
+  const mac = { ok: "trayTemplate.png", warn: "trayWarnTemplate.png", down: "trayDownTemplate.png", direct: "trayDirectTemplate.png" };
+  const win = { ok: "trayWin.png", warn: "trayWinWarn.png", down: "trayWinDown.png", direct: "trayWinDirect.png" };
   const img = nativeImage.createFromPath(path.join(__dirname, "..", "assets", (isMac ? mac : win)[state]));
   if (isMac) img.setTemplateImage(true);
   return img;
 }
 
+/** The app icon on notifications: macOS uses the bundle's own; elsewhere Electron would show its default. */
+function notifyIcon(): string | undefined {
+  return isMac ? undefined : path.join(__dirname, "..", "assets", "icon.png");
+}
+
 /**
- * The dashboard is a web page served by the router, so it opens in the user's own browser. With
- * the router down there is nothing to open: start it (or run setup, when that is what is missing)
- * and open the page once it answers, rather than sending the browser to a refused connection.
+ * The dashboard window. It opens with the router down too (its page is the app's own), and then on
+ * Status, where the way back is. Before setup there is no router to ask anything of, so the step
+ * that is actually missing comes first.
  */
 async function openDashboard(): Promise<void> {
-  if (last) {
-    void shell.openExternal(guiUrl());
-    return;
+  if (!last && needsSetup()) {
+    await setup();
+    await poll();
   }
-  // Before setup there is no router to start, so offer the step that is actually missing.
-  const message = needsSetup() ? (await setup(), "") : await startRouter();
-  // startRouter() returns once the CLI has finished; ask the router itself rather than waiting
-  // for the next tick, since the user is standing in front of the menu.
-  await poll();
-  if (last) {
-    void shell.openExternal(guiUrl());
-    return;
-  }
-  await dialog.showMessageBox({ type: "warning", message: L.offlineHeading, detail: [L.offlineBody, message].filter(Boolean).join("\n\n") });
+  showWindow(last ? undefined : "health");
 }
 
 type CliRuntime = { node: string; env: Record<string, string>; cli: string; router?: string };
@@ -411,7 +833,7 @@ async function reconcileRouter(s: Status): Promise<void> {
   if (!installedElsewhere && !runningElsewhere && !otherVersion) return;
   reconciled = true;
   const from = `${s.version}${s.runtime?.router ? ` (${s.runtime.router})` : ""}`;
-  if (Notification.isSupported()) new Notification({ title: L.updatedTitle(app.getVersion()), body: L.updatedRestarting(from) }).show();
+  if (Notification.isSupported()) new Notification({ title: L.updatedTitle(app.getVersion()), body: L.updatedRestarting(from), icon: notifyIcon() }).show();
   const outputs: string[] = [];
   if (installedElsewhere || runningElsewhere) outputs.push(await runCli(["install"]));
   outputs.push(await runCli(["restart"]));
@@ -442,6 +864,8 @@ function packagedRuntime(): CliRuntime | null {
 
 /** Prefer this app's bundled Electron runtime; existing installations retain their recorded runtime. */
 function cliPaths(): CliRuntime {
+  const override = process.env.CLAUDERIPPLE_APP_CLI;
+  if (override) return { node: process.execPath, env: { ELECTRON_RUN_AS_NODE: "1" }, cli: override };
   const packaged = packagedRuntime();
   if (packaged && fs.existsSync(packaged.cli)) return packaged;
   try {
@@ -463,14 +887,218 @@ function runCli(args: string[]): Promise<string> {
   return runCliResult(args).then((r) => r.output);
 }
 
-function runCliResult(args: string[]): Promise<{ ok: boolean; output: string }> {
+/**
+ * Runs the CLI without blocking anything. `stdout` is kept apart for the `--json` commands, whose
+ * one object must not be mixed with warnings on stderr. With `timeoutMs` a CLI that hangs (a
+ * supervisor that never answers) is ended rather than left holding a button down.
+ */
+function runCliResult(args: string[], timeoutMs = 0): Promise<{ ok: boolean; output: string; stdout: string; timedOut: boolean }> {
   const { node, env, cli } = cliPaths();
   return new Promise((resolve) => {
     // An update prints npm's and the installer's own lines; the default 1MB buffer is not for that.
-    execFile(node, [cli, ...args], { env: { ...process.env, ...env, CLAUDERIPPLE_HOME: home }, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, output: `${stdout}${stderr}${err ? `\n${err.message}` : ""}`.trim() });
+    execFile(node, [cli, ...args], { env: { ...process.env, ...env, CLAUDERIPPLE_HOME: home }, maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      const timedOut = !!err && timeoutMs > 0 && (err as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
+      resolve({ ok: !err, output: `${stdout}${stderr}${err ? `\n${err.message}` : ""}`.trim(), stdout: String(stdout), timedOut });
     });
   });
+}
+
+// ---- recovery: doctor, repair, direct -----------------------------------------------------
+// The CLI does the work and answers in JSON; this keeps what it last said and what is running,
+// and hands both to the dashboard (window.rippleApp) to draw its connection card.
+
+const ACTION_TIMEOUT_MS = 40_000;
+const DOCTOR_TIMEOUT_MS = 15_000;
+/** Background check, mainly to notice the direct mode while the router is still answering. */
+const DOCTOR_EVERY_MS = 5 * 60_000;
+/** While the window is open it should not show something a minute old. */
+const DOCTOR_WHILE_OPEN_MS = 10_000;
+const LOG_LINES = 40;
+
+const rec: { doctor: Doctor | null; doctorFailed: boolean; busy: Busy; result: ActionResult | null; restartClaude: boolean } = {
+  doctor: null,
+  doctorFailed: false,
+  busy: null,
+  result: null,
+  restartClaude: false,
+};
+/** When the connection last changed in a way Claude only picks up on its next start. */
+let restartOwedSince = 0;
+let restartCheckedAt = 0;
+/** How often a pending "reopen Claude" step asks whether Claude was reopened some other way. */
+const RESTART_CHECK_MS = 15_000;
+let doctorRun: Promise<void> | null = null;
+
+/** One `doctor` at a time; callers that arrive while one runs share it. */
+function refreshDoctor(): Promise<void> {
+  doctorRun ??= (async () => {
+    const r = await runCliResult(["doctor", "--json"], DOCTOR_TIMEOUT_MS);
+    const d = parseJsonOutput<Doctor>(r.stdout);
+    rec.doctor = d;
+    rec.doctorFailed = !d;
+  })().finally(() => {
+    doctorRun = null;
+    render();
+  });
+  return doctorRun;
+}
+
+/** The end of router.log, read from disk: it is there to look at precisely when the router is not. */
+function logTail(): string[] {
+  const file = path.join(home, "logs", "router.log");
+  try {
+    const size = fs.statSync(file).size;
+    const length = Math.min(size, 16 * 1024);
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, size - length);
+      return tailLines(buf.toString("utf8"), LOG_LINES).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+/** What the dashboard's connection card is drawn from. */
+function bridgeState(): AppState {
+  return {
+    doctor: rec.doctor,
+    doctorFailed: rec.doctorFailed,
+    routerAnswering: answered,
+    busy: rec.busy,
+    result: rec.result,
+    restartClaude: rec.restartClaude,
+    loginItem: loginItemOn(),
+    appVersion: app.getVersion(),
+    platform: process.platform,
+  };
+}
+
+let lastSent = "";
+/** Tells the open window, if any, when the state changed (render() runs on every poll). */
+function pushState(): void {
+  if (!mainWindow()) return;
+  const state = bridgeState();
+  const key = JSON.stringify(state);
+  if (key === lastSent) return;
+  lastSent = key;
+  sendToWindow("ripple-app:state", state);
+}
+
+function showWindow(view?: string): void {
+  openWindow(
+    {
+      lang: uiLang(),
+      savedBounds: () => appState().window ?? null,
+      saveBounds: (bounds) => writeAppState({ window: bounds }),
+      shown: () => {
+        lastSent = "";
+        if (!rec.busy) void refreshDoctor();
+      },
+    },
+    view,
+  );
+}
+
+type BridgeAction = Action | "refresh" | "login-item" | "logs";
+const BRIDGE_ACTIONS = new Set<string>(["repair", "direct-on", "direct-off", "restart-claude", "refresh", "login-item", "logs"]);
+
+/** Only our own page may drive the bridge, never something it navigated to. */
+function fromOurPage(event: Electron.IpcMainInvokeEvent): boolean {
+  return (event.senderFrame?.url ?? "").startsWith(`${ORIGIN}/`);
+}
+
+function wireBridge(): void {
+  ipcMain.handle("ripple-app:state", (event) => (fromOurPage(event) ? bridgeState() : null));
+  ipcMain.handle("ripple-app:log", (event) => (fromOurPage(event) ? logTail() : []));
+  ipcMain.handle("ripple-app:act", async (event, id: unknown) => {
+    if (!fromOurPage(event) || typeof id !== "string" || !BRIDGE_ACTIONS.has(id)) return null;
+    await act(id as BridgeAction);
+    return bridgeState();
+  });
+}
+
+async function act(id: BridgeAction): Promise<void> {
+  switch (id) {
+    case "repair":
+      return runAction("repair", ["repair", "--json"]);
+    case "direct-on":
+      return runAction("direct-on", ["direct", "on", "--json"]);
+    case "direct-off":
+      return runAction("direct-off", ["direct", "off", "--json"]);
+    case "restart-claude":
+      return restartClaude();
+    case "logs":
+      fs.mkdirSync(path.join(home, "logs"), { recursive: true });
+      void shell.openPath(path.join(home, "logs"));
+      return;
+    case "refresh":
+      if (rec.busy) return;
+      rec.busy = "checking";
+      render();
+      await Promise.all([poll(), refreshDoctor()]);
+      rec.busy = null;
+      render();
+      return;
+    case "login-item":
+      setLoginItem(true);
+      render();
+      return;
+  }
+}
+
+async function runAction(action: "repair" | "direct-on" | "direct-off", args: string[]): Promise<void> {
+  if (rec.busy) return;
+  rec.busy = action;
+  rec.result = null;
+  render();
+  const r = await runCliResult(args, ACTION_TIMEOUT_MS);
+  const out = parseJsonOutput<RepairOutput & DirectOutput>(r.stdout);
+  const ok = !r.timedOut && out?.ok === true;
+  const details =
+    action === "repair"
+      ? repairDetails(out, r.output)
+      : [out?.detail ?? "", ...(ok ? [] : tailLines(out ? "" : r.output, 8))].filter(Boolean);
+  rec.result = { action, ok, timedOut: r.timedOut, details, at: Date.now() };
+  if (ok && out?.restartClaude) {
+    // A Claude that is not running picks the change up when it next starts: nothing to ask for.
+    restartOwedSince = Date.now();
+    rec.restartClaude = restartStillOwed(restartOwedSince - 1, await claudeStartedAt());
+  }
+  if (out?.doctor) {
+    rec.doctor = out.doctor;
+    rec.doctorFailed = false;
+  }
+  rec.busy = null;
+  await poll();
+  if (!out?.doctor) await refreshDoctor();
+  render();
+}
+
+async function restartClaude(): Promise<void> {
+  if (rec.busy) return;
+  const options: Electron.MessageBoxOptions = {
+    type: "question",
+    message: L.restartConfirm,
+    detail: L.restartConfirmDetail,
+    buttons: [L.restartNow, L.cancel],
+    defaultId: 0,
+    cancelId: 1,
+  };
+  const parent = mainWindow();
+  const choice = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options);
+  if (choice.response !== 0) return;
+  rec.busy = "restart-claude";
+  rec.result = null;
+  render();
+  const ok = await reopenClaude();
+  rec.busy = null;
+  rec.result = { action: "restart-claude", ok, details: [], at: Date.now() };
+  if (ok) rec.restartClaude = false;
+  render();
 }
 
 // ---- updates ----------------------------------------------------------------------------
@@ -483,6 +1111,66 @@ type UpdateCheck = { current: string; latest: string | null; newer: boolean; kin
 let availableUpdate: UpdateCheck | null = null;
 let updating = false;
 const UPDATE_CHECK_MS = 12 * 60 * 60 * 1000;
+let routerUpdateUntil = 0;
+let updateNotification: Notification | null = null;
+let updateSeen: UpdateSeen | undefined;
+const updateSeenFile = path.join(home, "update-notifications.json");
+
+function loadUpdateSeen(): UpdateSeen {
+  try { return readUpdateSeen(JSON.parse(fs.readFileSync(updateSeenFile, "utf8"))); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`update notification state: ${error}`);
+    return { updated: [], available: [] };
+  }
+}
+
+async function relaunchTray(): Promise<void> {
+  app.releaseSingleInstanceLock();
+  const result = await runCliResult(["tray"]);
+  if (!result.ok) {
+    // Keep a functioning tray if its replacement could not start.
+    if (!app.requestSingleInstanceLock()) app.quit();
+    throw new Error(result.output || "could not relaunch tray");
+  }
+  app.quit();
+}
+
+async function handleRouterUpdate(status: Status): Promise<void> {
+  if (status.autoUpdate?.running) routerUpdateUntil = Date.now() + 10 * 60_000;
+  else routerUpdateUntil = 0;
+  if (updating) return;
+  updateSeen ??= loadUpdateSeen();
+  const notice = updateNotice(status.version, app.getVersion(), status.autoUpdate, updateSeen);
+  if (!notice) return;
+  // Memory dedup is immediate; disk dedup must succeed before a relaunch to avoid restart loops.
+  updateSeen = rememberUpdate(updateSeen, notice);
+  fs.mkdirSync(home, { recursive: true });
+  const tmp = `${updateSeenFile}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(updateSeen) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, updateSeenFile);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  if (notice.kind === "available") {
+    const check: UpdateCheck = { current: status.version, latest: notice.version, newer: true, kind: status.autoUpdate?.kind ?? "unknown" };
+    availableUpdate = check;
+    if (Notification.isSupported()) {
+      updateNotification = new Notification({ title: "ClaudeRipple", body: L.autoAvailable(notice.version), icon: notifyIcon() });
+      updateNotification.on("click", () => { void offerUpdate(check).catch((error: unknown) => console.error(`offer update: ${error}`)); });
+      updateNotification.show();
+    }
+    return;
+  }
+  if (Notification.isSupported()) {
+    updateNotification = new Notification({ title: "ClaudeRipple", body: L.autoUpdated(notice.version), icon: notifyIcon() });
+    updateNotification.show();
+  }
+  if (notice.relaunch) {
+    updating = true;
+    try { await relaunchTray(); } finally { updating = false; }
+  }
+}
 
 async function checkForUpdate(): Promise<UpdateCheck | null> {
   const r = await runCliResult(["update", "--check", "--json"]);
@@ -524,7 +1212,18 @@ async function offerUpdate(check: UpdateCheck): Promise<void> {
   updating = true;
   render();
   const version = check.latest ?? "";
-  if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updating(version) }).show();
+  if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updating(version), icon: notifyIcon() }).show();
+  if (last?.autoUpdate) {
+    // Share the router's coordinator with its scheduler instead of racing a second installer.
+    try {
+      const response = await fetch(`${adminUrl()}api/update`, { method: "POST", signal: AbortSignal.timeout(35_000) });
+      if (!response.ok) throw new Error(await response.text());
+      routerUpdateUntil = Date.now() + 10 * 60_000;
+    } catch (error) {
+      await dialog.showMessageBox({ type: "warning", message: L.updateFailed, detail: String(error) });
+    } finally { updating = false; render(); }
+    return; // /api/status will confirm completion, notify and relaunch this tray.
+  }
   const r = await runCliResult(["update"]);
   updating = false;
   if (!r.ok) {
@@ -533,10 +1232,9 @@ async function offerUpdate(check: UpdateCheck): Promise<void> {
     return;
   }
   availableUpdate = null;
-  if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updateDone(version) }).show();
+  if (Notification.isSupported()) new Notification({ title: "ClaudeRipple", body: L.updateDone(version), icon: notifyIcon() }).show();
   // A new tray from the new files, then this one goes.
-  await runCliResult(["tray"]);
-  app.quit();
+  await relaunchTray();
 }
 
 // Offer setup only when there is no working installation at all. A developer who runs the router
@@ -588,9 +1286,13 @@ function windowsText(quota: Quota | undefined): string {
 }
 
 function render(): void {
+  pushState();
   if (!tray) return;
   const state = healthy(last);
-  tray.setImage(icon(state));
+  // The direct mode is chosen, not broken: its own mark, and no "cannot connect" line.
+  const shown = trayState(state, rec.doctor);
+  const direct = shown === "direct";
+  tray.setImage(icon(shown));
   const s = last;
   const quota = Object.values(s?.chatgpt?.quota ?? {}).find((q) => q) as { plan_type?: string; rate_limits?: { primary?: { used_percent?: number; reset_after_seconds?: number } } } | undefined;
   const quotaLine = quota?.rate_limits?.primary
@@ -602,22 +1304,29 @@ function render(): void {
   // "Router not running" is useless advice to someone who has never set it up — that reads as a
   // fault when the truth is there is one step left. Separate the two states everywhere.
   const unconfigured = !s && needsSetup();
-  const headline = s
-    ? `ClaudeRipple · ${state === "ok" ? L.healthy : L.attentionNeeded}`
-    : `ClaudeRipple · ${unconfigured ? L.setupNeeded : L.routerNotRunning}`;
+  const headline = direct
+    ? `ClaudeRipple · ${L.directHeadline}`
+    : s
+      ? `ClaudeRipple · ${state === "ok" ? L.healthy : L.attentionNeeded}`
+      : `ClaudeRipple · ${unconfigured ? L.setupNeeded : L.routerNotRunning}`;
   // What is actually in the way, not only that something is: the router's readiness list names it.
   const problems = (s?.readiness?.problems ?? []).map((code) => L.problem(code));
-  const detail = s
-    ? [connected ? L.connected : L.notConnected, ...problems, quotaLine].filter(Boolean).join(" · ")
-    : unconfigured
-      ? L.setupNeededDetail
-      : L.downNotifyTitle;
+  const detail = direct
+    ? null
+    : s
+      ? [connected ? L.connected : L.notConnected, ...problems, quotaLine].filter(Boolean).join(" · ")
+      : unconfigured
+        ? L.setupNeededDetail
+        : L.downNotifyTitle;
   // One line per Claude subscription account, current login first (#40).
   const claudeLines = (s?.claude?.accounts ?? [])
     .map((account) => ({ account, windows: windowsText(account.quota) }))
     .filter(({ windows }) => windows)
     .map(({ account, windows }) => ({ label: L.claudeUsage(account.id === "current" ? L.claudeCurrent : account.label, windows), click: () => void openDashboard() }) as Electron.MenuItemConstructorOptions);
   const template: Electron.MenuItemConstructorOptions[] = [
+    // First, because it is the way back when nothing else works: the window needs no router.
+    { label: L.open, click: () => void openDashboard() },
+    { type: "separator" },
     { label: headline, click: () => void openDashboard() },
     ...(detail ? [{ label: detail, click: () => void openDashboard() } as Electron.MenuItemConstructorOptions] : []),
     ...claudeLines,
@@ -625,8 +1334,6 @@ function render(): void {
       ? [{ label: updating ? L.updating(availableUpdate.latest ?? "") : L.updateAvailableItem(availableUpdate.latest ?? ""), enabled: !updating, click: () => void offerUpdate(availableUpdate!) } as Electron.MenuItemConstructorOptions]
       : []),
     { type: "separator" },
-    // Enabled even when the router is down: it is started first, then the page is opened.
-    { label: L.openDashboard, click: () => void openDashboard() },
     { label: L.startAtLogin, type: "checkbox", checked: loginItemOn(), click: (item) => setLoginItem(item.checked) },
     { type: "separator" },
     { label: unconfigured ? L.runSetup : L.rerunSetup, click: () => void setup() },
@@ -649,11 +1356,40 @@ function render(): void {
     { label: L.quit, role: "quit" },
   ];
   tray.setContextMenu(Menu.buildFromTemplate(template));
-  tray.setToolTip(s ? L.tooltip(state) : L.tooltipDown);
+  tray.setToolTip(direct ? L.tooltipDirect : s ? L.tooltip(state) : L.tooltipDown);
 }
+
+/**
+ * The dashboard this app draws: the copy of packages/ui inside a packaged build, else the one next
+ * to the tray's own folder (a checkout's packages/ui, an npm install's dist/ui — the same files the
+ * router serves).
+ */
+function uiRoot(): string {
+  const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  const candidates = [
+    ...(resources ? [path.join(resources, "clauderipple", "packages", "ui")] : []),
+    path.resolve(__dirname, "..", "..", "ui"),
+  ];
+  return candidates.find((dir) => fs.existsSync(path.join(dir, "index.html"))) ?? candidates[candidates.length - 1]!;
+}
+
+registerScheme();
+
+// One tray. `clauderipple tray` run while one is up started a second icon (Windows VM,
+// 2026-10-10); the newcomer now leaves at once with code 0, which the CLI reads as "already running".
+if (process.env.CLAUDERIPPLE_APP_USER_DATA) app.setPath("userData", process.env.CLAUDERIPPLE_APP_USER_DATA);
+if (!app.requestSingleInstanceLock()) app.exit(0);
+
+// Opening the app again (Finder, Start menu, `clauderipple tray`) while it already runs in the
+// tray is someone looking for it: bring the window forward rather than nothing.
+app.on("second-instance", () => {
+  if (app.isReady()) showWindow(last ? undefined : "health");
+});
 
 app.whenReady().then(() => {
   L = STRINGS[uiLang()];
+  handleScheme(uiRoot(), adminUrl);
+  wireBridge();
   // Without this, Windows attributes our notifications to "Electron" instead of ClaudeRipple.
   if (process.platform === "win32") app.setAppUserModelId("com.clauderipple.app");
   // macOS keeps its application menu (it owns Cmd-Q and the edit shortcuts); elsewhere it is noise.
@@ -661,11 +1397,24 @@ app.whenReady().then(() => {
   if (isMac) app.dock?.hide();
   // Default to starting at login on first run; after that the user's choice stands.
   if (!appState().loginItemInitialized) setLoginItem(true);
+  // An entry an older version wrote names bare Electron (the query without args finds it); the
+  // user had start-at-login on, so it is rewritten with the script rather than left broken.
+  else if (loginItemLaunch() && app.getLoginItemSettings().openAtLogin && !loginItemOn()) setLoginItem(true);
   tray = new Tray(icon("down"));
   tray.on("click", () => tray?.popUpContextMenu());
   render();
+  // Opened from its icon (the CLI sets this; a login launch does not): show the window, not just a
+  // tray icon the person may never notice. Taken out so an update's relaunch does not inherit it.
+  if (process.env.CLAUDERIPPLE_APP_SHOW === "1") {
+    delete process.env.CLAUDERIPPLE_APP_SHOW;
+    showWindow("health");
+  }
   void poll();
   setInterval(() => void poll(), POLL_MS);
+  // What the health poll cannot see (the direct mode, a supervisor gone missing) comes from doctor.
+  setTimeout(() => void refreshDoctor(), 3_000);
+  setInterval(() => void (!rec.busy && refreshDoctor()), DOCTOR_EVERY_MS);
+  setInterval(() => void (windowVisible() && !rec.busy && refreshDoctor()), DOCTOR_WHILE_OPEN_MS);
   if (needsSetup()) void promptForSetup();
   // Not at the very start: a tray opened at login shares the first minute with everything else.
   setTimeout(() => void checkForUpdate(), 60_000);

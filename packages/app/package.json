@@ -1,6 +1,6 @@
 {
   "name": "@clauderipple/app",
-  "version": "0.8.0",
+  "version": "0.12.7",
   "private": true,
   "description": "ClaudeRipple menu-bar app (macOS). Hosts the local GUI served by the router and shows chain health in the tray.",
   "license": "GPL-3.0-only",
@@ -8,6 +8,7 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
     "start": "npm run build && electron .",
     "icons": "node scripts/make-icons.mts",
     "dist": "npm run icons && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir -c.directories.output=release-dev",
@@ -95,7 +96,7 @@
           ]
         }
       ],
-      "icon": "build/icon.png",
+      "icon": "assets/icon.ico",
       "artifactName": "${productName}-${version}-win-${arch}.${ext}",
       "signExecutable": false
     },

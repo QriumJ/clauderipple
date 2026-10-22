@@ -1,0 +1,278 @@
+#!/usr/bin/env node
+// ripple-host: runs Claude Code sessions on this machine for the phone.
+//   ripple-host [--bind 127.0.0.1|tailscale|lan|0.0.0.0|<ip>] [--port 8797] [--relay <https url>|off] [--new-token]
+//   ripple-host install [same options] [--print]   launchd agent com.clauderipple.host (--print: only show the plist)
+//   ripple-host uninstall                           stop and remove the agent
+//   ripple-host status                              agent state and health (prints no secret)
+//   ripple-host pair                                print the pairing QR and link (they carry the pairing key)
+// Options are remembered in host.json. The host never stops on its own; day to day it runs as the
+// launchd agent (KeepAlive), which restarts it after a crash; on start it recovers persisted
+// sessions and permission requests (Sessions.recover). With a relay it also keeps one outbound
+// socket to it, so the phone reaches the Mac from anywhere over an https origin (relay.ts).
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { listSessions } from "@anthropic-ai/claude-agent-sdk";
+import { sdkQuery as query } from "./sdk-launcher.ts";
+import qrcode from "qrcode-generator";
+import nacl from "tweetnacl";
+import { WebSocket } from "ws";
+import { loadConfig, newToken, normalizeRelay, pairingUrl, relayPairingUrl, remoteHome, resolveBind, saveConfig } from "./config.ts";
+import type { HostConfig } from "./config.ts";
+import { MacAway } from "./away.ts";
+import { toB64u } from "./e2ee.ts";
+import { PermissionQueue } from "./permissions.ts";
+import { PowerHold } from "./power.ts";
+import { Notifier, loadVapid, webPushSender } from "./push.ts";
+import { ExpoNotifier, expoSender } from "./expo-push.ts";
+import { RelayHost, loadHostKey } from "./relay.ts";
+import type { WsLike } from "./relay.ts";
+import { RouterClient } from "./router.ts";
+import { HostServer } from "./server.ts";
+import { LocalControl } from "./local-control.ts";
+import { findClaude, specFor, cliLoginWarning } from "./service.ts";
+import { installService, uninstallService, serviceStatus, servicePaths, renderService, supervisorName, controlShutdown, refreshPlan, hostBusy } from "./host-service.ts";
+import { Sessions } from "./sessions.ts";
+import { desktopHandoff } from "./handoff.ts";
+import type { QueryFn } from "./sessions.ts";
+import { claudeBinary, claudeCodeLogin } from "../../cli/src/claude-auth.ts";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const VERSION = (JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")) as { version: string }).version;
+const out = (s: string): void => { process.stdout.write(s); };
+
+function arg(name: string): string | undefined {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > 0 ? process.argv[i + 1] : undefined;
+}
+
+function qr(text: string): string {
+  const q = qrcode(0, "M");
+  q.addData(text);
+  q.make();
+  const n = q.getModuleCount();
+  const dark = (r: number, c: number): boolean => r >= 0 && c >= 0 && r < n && c < n && q.isDark(r, c);
+  const lines: string[] = [];
+  // Two rows per character with half blocks and a quiet zone of 2. Black on an explicit white
+  // background, so it scans the same on a light or a dark terminal.
+  for (let r = -2; r < n + 2; r += 2) {
+    let line = "\x1b[30;47m";
+    for (let c = -2; c < n + 2; c++) {
+      const top = dark(r, c), bottom = dark(r + 1, c);
+      line += top && bottom ? "█" : top ? "▀" : bottom ? "▄" : " ";
+    }
+    lines.push(line + "\x1b[0m");
+  }
+  return lines.join("\n");
+}
+
+/** --bind / --port / --relay / --new-token given on the command line are remembered. */
+function configFromArgs(dir: string): HostConfig {
+  const cfg = loadConfig(dir);
+  const bind = arg("bind");
+  const port = arg("port");
+  const relay = arg("relay");
+  if (bind) cfg.bind = bind;
+  if (port) cfg.port = Number(port);
+  if (relay === "off") delete cfg.relay;
+  else if (relay) cfg.relay = normalizeRelay(relay);
+  if (process.argv.includes("--new-token")) cfg.token = newToken();
+  if (bind || port || relay || process.argv.includes("--new-token")) saveConfig(cfg, dir);
+  return cfg;
+}
+
+function printPairing(cfg: HostConfig, dir: string): void {
+  const where = resolveBind(cfg.bind);
+  let url: string;
+  if (cfg.relay) {
+    // The fragment (token, server id, host key) never leaves the phone; the relay only sees the page request.
+    url = relayPairingUrl(cfg.relay, cfg.serverId, toB64u(loadHostKey(dir, nacl).publicKey), cfg.token);
+    out(`\nThrough the relay ${cfg.relay} (works from anywhere; notifications need this https address).\n`);
+  } else {
+    url = pairingUrl(where.advertise, cfg.port, cfg.token);
+    out(where.reachableFromPhone
+      ? "\nDirect http: works on this network only, and without notifications (they need https: use --relay).\n"
+      : "\nOnly this computer can reach it. For the phone, use --relay <url> (anywhere) or --bind lan / tailscale (same network).\n");
+  }
+  out(`\nScan with the phone's camera (the link carries the pairing key — do not share it):\n\n${qr(url)}\n\n${url}\n\n`);
+}
+
+/**
+ * Under launchd both streams are the log file: start every line with an ISO time, so a run of
+ * reconnects or errors can be placed next to sleep, network and relay events afterwards. Wraps the
+ * stream itself, so lines written by libraries and child processes' relayed output get one too.
+ */
+function stampLines(stream: NodeJS.WriteStream): void {
+  const write = stream.write.bind(stream) as (chunk: string | Uint8Array, ...rest: unknown[]) => boolean;
+  let lineStart = true;
+  stream.write = ((chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    if (!text) return write(chunk, ...rest);
+    let stamped = "";
+    for (const piece of text.split(/(?<=\n)/)) {
+      stamped += (lineStart && piece !== "\n" ? `${new Date().toISOString()} ` : "") + piece;
+      lineStart = piece.endsWith("\n");
+    }
+    return write(stamped, ...rest);
+  }) as typeof stream.write;
+}
+
+async function runHost(): Promise<void> {
+  if (!process.stdout.isTTY) stampLines(process.stdout);
+  if (!process.stderr.isTTY) stampLines(process.stderr);
+  const dir = remoteHome();
+  const cfg = configFromArgs(dir);
+  const where = resolveBind(cfg.bind);
+  const router = new RouterClient(cfg.adminUrl);
+  const permissions = PermissionQueue.open(path.join(dir, "permissions.json"));
+  let server: HostServer | null = null;
+  const claudePath = findClaude(cfg.claudePath);
+  const power = new PowerHold();
+  const log = (line: string): void => { process.stderr.write(`${line}\n`); };
+  // A VAPID subject must be an https: or mailto: URL; the relay is this host's one real https origin.
+  const vapid = loadVapid(dir, cfg.relay?.startsWith("https:") ? cfg.relay : "mailto:ripple-host@clauderipple.invalid");
+  let sessions: Sessions | null = null;
+  const notifier = new Notifier({
+    dir, send: webPushSender(vapid), log,
+    seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
+    summary: (id) => sessions?.summaryOf(id),
+  });
+  const expoNotifier = new ExpoNotifier({ dir, send: expoSender(), log,
+    seenRecently: (id) => server?.sessionSeenRecently(id) ?? false,
+    context: (id, event) => sessions?.pushContext(id, event) ?? {},
+  });
+  // Mac sessions the host is not tailing push only while the Mac is away (screen locked or idle).
+  const away = new MacAway({ log });
+  sessions = new Sessions({
+    dir, router, permissions,
+    desktopProjects: path.join(os.homedir(), ".claude", "projects"),
+    ...(process.platform === "darwin" ? { desktopSidebar: {} } : {}),
+    queryFn: query as unknown as QueryFn,
+    ...(claudePath ? { claudePath, ...(process.platform === "darwin" ? { handoff: desktopHandoff(claudePath) } : {}) } : {}),
+    log,
+    onEvent: (id, event) => { server?.onEvent(id); void notifier.onEvent(id, event); void expoNotifier.onEvent(id, event); },
+    away: () => away.away(),
+    onAlert: (id, body) => { void notifier.onEvent(id, body); void expoNotifier.onEvent(id, body); },
+    onSessions: () => { server?.onSessions(); if (sessions) power.update(sessions.busy()); },
+    onDesktopProblem: (problem) => server?.setDesktopProblem(problem),
+  });
+  sessions.recover();
+  const live = sessions;
+  const host = new HostServer({
+    listen: where.listen, port: cfg.port, token: cfg.token, webDir: path.resolve(here, "..", "web"), sessions: live, router,
+    hostName: os.hostname().replace(/\.local$/, ""), version: VERSION,
+    recentCli: async () => (await listSessions({ limit: 300, includeProgrammatic: false })).flatMap((s) => (s.cwd ? [{ path: s.cwd, lastUsed: s.lastModified }] : [])),
+    log,
+    push: { publicKey: vapid.publicKey, subscribe: (id, sub, lang) => notifier.subscribe(id, sub, lang), unsubscribe: (id) => notifier.unsubscribe(id) },
+    expoPush: expoNotifier,
+    pushDevices: () => [...new Set([...notifier.devices(), ...expoNotifier.devices()])],
+    clearPush: () => {
+      for (const id of notifier.devices()) notifier.unsubscribe(id);
+      for (const id of expoNotifier.devices()) expoNotifier.unsubscribe(id);
+    },
+    local: new LocalControl({
+      dir, config: cfg, version: VERSION, hostPublicKey: toB64u(loadHostKey(dir, nacl).publicKey),
+      phones: () => server?.phones() ?? [],
+      rotate: token => { server?.rotateToken(token); },
+      shutdown: () => stop(),
+      busy: () => live.busy(),
+    }),
+  });
+  server = host;
+  await host.listen();
+  power.update(live.busy());
+  const relay = cfg.relay
+    ? new RelayHost({
+      relay: cfg.relay, serverId: cfg.serverId, secret: cfg.relaySecret, hostKey: loadHostKey(dir, nacl), nacl, log,
+      makeSocket: (url, headers) => new WebSocket(url, { headers, maxPayload: 2 * 1024 * 1024 }) as unknown as WsLike,
+      onPeer: (peer) => host.connected(peer),
+    })
+    : null;
+  relay?.start();
+
+  out(`\nRipple Remote ${VERSION} — listening on ${where.listen}:${cfg.port}${cfg.relay ? `, relay ${cfg.relay}` : ""}\n`);
+  if (claudePath) out(`Claude Code: ${claudePath}\n`);
+  // Under launchd stdout is a log file; the pairing link carries the token and must not land there.
+  if (process.stdout.isTTY) printPairing(cfg, dir);
+  else out("Pairing QR: run `ripple-host pair` (npm run remote -- pair) in a terminal.\n");
+
+  const stop = (): void => {
+    power.release();
+    relay?.stop();
+    live.shutdown();
+    void host.close().then(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+}
+
+async function status(): Promise<void> {
+  const cfg = loadConfig(remoteHome());
+  const st = serviceStatus();
+  const p = servicePaths();
+  out(`${supervisorName()}: ${st.installed ? p.definition : "not installed"}${st.loaded ? `, loaded (state ${st.state ?? "?"}${st.pid ? `, pid ${st.pid}` : ""}${st.lastExit ? `, last exit ${st.lastExit}` : ""})` : ", not loaded"}\n`);
+  const listen = resolveBind(cfg.bind).listen;
+  const probe = listen === "0.0.0.0" || listen === "::" ? "127.0.0.1" : listen;
+  let health = "no answer";
+  try {
+    const r = await fetch(`http://${probe.includes(":") ? `[${probe}]` : probe}:${cfg.port}/healthz`, { signal: AbortSignal.timeout(2000) });
+    health = r.ok ? "ok" : `HTTP ${r.status}`;
+  } catch { /* no answer */ }
+  out(`host: ${probe}:${cfg.port} — ${health} (bind ${cfg.bind})\n`);
+  out(`relay: ${cfg.relay ?? "off"}\nlogs: ${p.log}\n`);
+}
+
+async function installCmd(): Promise<void> {
+  const dir = remoteHome();
+  // Read the running host's old port before command-line options persist a replacement.
+  if (process.platform === "win32" && !process.argv.includes("--print")) await controlShutdown(dir);
+  const cfg = process.argv.includes("--print") ? loadConfig(dir, false) : configFromArgs(dir);
+  // The CLI the host will start; also what a person is told to run when it has no login.
+  const claudePath = findClaude(cfg.claudePath);
+  const spec = hostSpec(claudePath);
+  if (process.argv.includes("--print")) { out(renderService(spec)); return; }
+  for (const line of await installService(spec)) out(`${line}\n`);
+  out(`Pair the phone: clauderipple remote pair\n`);
+  // The host starts Claude Code through the Agent SDK and passes no credential of its own, so a
+  // machine where the CLI was never logged in fails on every turn (issue #71). Say so now; the
+  // install itself is never held up by it.
+  const warning = cliLoginWarning(await claudeCodeLogin(), claudePath ?? claudeBinary() ?? null);
+  if (warning) out(`⚠ ${warning}\n`);
+}
+
+function hostSpec(claudePath: string | undefined): ReturnType<typeof specFor> {
+  return specFor({ script: fileURLToPath(import.meta.url), claudePath, ...(process.env.RIPPLE_REMOTE_HOME ? { remoteHome: process.env.RIPPLE_REMOTE_HOME } : {}) });
+}
+
+/** Run by `clauderipple update` from the new files: restarts a host this installation registered (refreshPlan). */
+async function refreshCmd(): Promise<void> {
+  const p = servicePaths();
+  let definition: string | null = null;
+  try { definition = fs.readFileSync(p.definition, "utf8"); } catch { /* not registered */ }
+  const plan = refreshPlan({ installed: serviceStatus().installed, definition, script: fileURLToPath(import.meta.url), busy: definition === null ? undefined : await hostBusy() });
+  if (plan === "absent") return;
+  if (plan === "foreign") { out(`phone host: runs from other files (${p.definition}); left as it is\n`); return; }
+  if (plan === "busy") { out("phone host: a turn is in progress, so it keeps the old code; restart it afterwards with: clauderipple remote install\n"); return; }
+  const spec = hostSpec(findClaude(loadConfig(remoteHome(), false).claudePath));
+  for (const line of await installService(spec)) out(`phone host: ${line}\n`);
+}
+
+async function main(): Promise<void> {
+  const sub = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : null;
+  switch (sub) {
+    case null: return runHost();
+    case "install": return installCmd();
+    case "refresh": return refreshCmd();
+    case "uninstall": for (const line of await uninstallService()) out(`${line}\n`); return;
+    case "status": return status();
+    case "pair": { const dir = remoteHome(); printPairing(configFromArgs(dir), dir); return; }
+    default: throw new Error(`unknown command "${sub}" (install, uninstall, status, pair)`);
+  }
+}
+
+main().catch((e: Error) => {
+  process.stderr.write(`ripple-host: ${e.message}\n`);
+  process.exit(1);
+});

@@ -181,9 +181,13 @@ export function effortFromRequest(value: unknown): string | undefined {
 }
 
 /** Convert an OpenAI Responses request to a cache-friendly Anthropic Messages request. */
-/** Claude models that accept `output_config.effort` (measured 2026-09-13: Haiku 4.5 answers 400 "does not support the effort parameter"). */
+/**
+ * Claude models that accept `output_config.effort` (measured 2026-09-13: Haiku 4.5 answers 400 "does
+ * not support the effort parameter"). Mythos 5 and 5.1 list `effort` among their capabilities in
+ * Claude Code 2.1.295's model catalogue (read 2026-10-14).
+ */
 export function claudeSupportsEffort(model: string): boolean {
-  return /^claude-(opus|sonnet|fable)-(4-[6-9]|5)(-|$)/.test(model);
+  return /^claude-(opus|sonnet|fable|mythos)-(4-[6-9]|5)(-|$)/.test(model);
 }
 
 /**

@@ -11,6 +11,7 @@ import zlib from "node:zlib";
 import type { Config, AnthropicCompatibleProvider, AnthropicProvider } from "../config.ts";
 import { providerFor } from "../config.ts";
 import type { Logger } from "../log.ts";
+import type { HoldGate } from "../hold.ts";
 import { resolve } from "../routing.ts";
 import { PRESETS } from "../presets.ts";
 import { resolveCompatibleCaps, sanitizeForCompatible } from "../compat.ts";
@@ -51,6 +52,8 @@ type IngressDeps = {
    * or the first one configured (null name), or — with none configured — Codex's own login alone.
    */
   chatgpt?: (name: string | null) => ChatGptAdapter;
+  /** While engaged (a network switch, tether.ts), new model calls wait here instead of starting. */
+  hold?: HoldGate;
 };
 
 /**
@@ -87,6 +90,9 @@ export type IngressStats = {
   started: number;
   completed: number;
   failed: number;
+  /** Epoch ms of the last model call that started / finished here (see proxy.ts `Stats`). */
+  lastMessageStartedAt?: number;
+  lastMessageEndedAt?: number;
 };
 
 type Outcome = { status: number; bytes: number; usage?: RequestUsage; stopReason?: string; note?: string };
@@ -172,6 +178,8 @@ export class OpenAiIngress {
   private readonly claudeAccounts: ClaudeAccountAuthPool;
   private readonly deps: IngressDeps;
   private draining = false;
+  /** Model calls waiting at the hold gate (not yet in `stats`): drain() waits for them too. */
+  private held = 0;
 
   constructor(deps: IngressDeps) {
     this.deps = deps;
@@ -210,9 +218,12 @@ export class OpenAiIngress {
   /** Stop new connections, reject new model work on keep-alive sockets, then close after model calls drain. */
   async drain(maxMs: number, onProgress?: (n: number) => void): Promise<void> {
     this.draining = true;
+    // As in the proxy: a call held for a network switch goes on now, meets the 503, and is waited for.
+    const released = this.deps.hold?.close() ?? 0;
+    if (released) this.deps.log.info(`OPENAI drain: released ${released} model call(s) held for a network switch`);
     this.server.close();
     const start = Date.now();
-    while (this.stats.messagesInFlight > 0 && Date.now() - start < maxMs) {
+    while ((this.stats.messagesInFlight > 0 || this.held > 0) && Date.now() - start < maxMs) {
       onProgress?.(this.stats.messagesInFlight);
       await new Promise((resolveP) => setTimeout(resolveP, 250));
     }
@@ -231,17 +242,35 @@ export class OpenAiIngress {
     const path = (req.url ?? "/").split("?")[0] ?? "/";
     const method = req.method ?? "GET";
     const isCall = method === "POST" && (path === "/v1/responses" || path === "/v1/responses/compact" || path === "/v1/chat/completions");
+    // As in the proxy (hold.ts): during a network switch a new model call waits here, unread and
+    // uncounted, then goes ahead. Draining refuses below instead.
+    const hold = this.deps.hold;
+    if (isCall && hold?.engaged && !this.draining) {
+      this.held++;
+      const held = await hold.wait().finally(() => this.held--);
+      this.deps.log.info(`OPENAI HOLD ${method} ${path} waited ${(held.ms / 1000).toFixed(1)}s${held.timedOut ? " (longest hold reached; going ahead)" : ""}`);
+      if (req.socket?.destroyed) {
+        this.deps.log.warn(`OPENAI HOLD ${method} ${path}: the client left while held`);
+        return;
+      }
+    }
     this.stats.started++;
     this.stats.inFlight++;
-    if (isCall) this.stats.messagesInFlight++;
     const started = Date.now();
+    if (isCall) {
+      this.stats.messagesInFlight++;
+      this.stats.lastMessageStartedAt = started;
+    }
     let record: Omit<RequestRecord, "id" | "at" | "ms" | "status" | "ok" | "usage" | "stopReason" | "note"> = { kind: "messages", source: "-", target: "-", provider: "-", stream: false };
     let completed = false;
     const finish = (status: number, bytes: number, extra: Omit<Outcome, "status" | "bytes"> = {}): void => {
       if (completed) return;
       completed = true;
       this.stats.inFlight--;
-      if (isCall) this.stats.messagesInFlight--;
+      if (isCall) {
+        this.stats.messagesInFlight--;
+        this.stats.lastMessageEndedAt = Date.now();
+      }
       if (status >= 200 && status < 400) this.stats.completed++;
       else this.stats.failed++;
       const ms = Date.now() - started;
@@ -365,8 +394,8 @@ export class OpenAiIngress {
       // is an OpenAI wire, which the refusal below would otherwise turn away on the provider's type
       // alone. One subscription is one provider, so the model decides.
       const provider = providerFor(configured, route.model);
-      if (provider.type === "chatgpt" || provider.type === "openai-compatible" || provider.type === "google") {
-        const label = provider.type === "chatgpt" ? "ChatGPT" : provider.type === "google" ? "Google" : "OpenAI-compatible";
+      if (provider.type === "chatgpt" || provider.type === "openai-compatible" || provider.type === "google" || provider.type === "grok") {
+        const label = provider.type === "chatgpt" ? "ChatGPT" : provider.type === "google" ? "Google" : provider.type === "grok" ? "Grok" : "OpenAI-compatible";
         const bytes = sendJson(res, 400, openAiError(`${label} provider is not available through OpenAI ingress`, "invalid_request_error", "unsupported_provider"));
         finish(400, bytes, { note: `model ${requested} -> ${provider.type} provider unsupported` });
         return;

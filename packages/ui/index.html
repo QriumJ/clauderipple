@@ -1,126 +1,225 @@
 <title>ClaudeRipple</title>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'" />
+<link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="style.css" />
 
-<nav>
-  <div class="brand"><svg viewBox="0 0 1024 1024" aria-hidden="true"><circle cx="512" cy="512" r="128" fill="#6a56d6"/><circle cx="512" cy="512" r="245" stroke="#8a78e6" stroke-width="56" fill="none" opacity="0.7"/><path d="M512 108C735.124 108 916 288.876 916 512C916 735.124 735.124 916 512 916C288.876 916 108 735.124 108 512" stroke="#8a78e6" stroke-width="56" stroke-linecap="round" fill="none" opacity="0.35"/></svg><span data-i18n="brand">ClaudeRipple</span></div>
-  <button data-view="health" class="nav-btn" data-i18n="nav.health">Status</button>
-  <button data-view="slots" class="nav-btn" data-i18n="nav.slots">Model links</button>
-  <button data-view="providers" class="nav-btn" data-i18n="nav.providers">Providers</button>
-  <button data-view="clients" class="nav-btn" data-i18n="nav.clients">Clients</button>
-  <button data-view="logs" class="nav-btn" data-i18n="nav.logs">Logs</button>
-  <button data-view="about" class="nav-btn" data-i18n="nav.about">About</button>
-  <div class="nav-spacer"></div>
-  <button class="lang-toggle" id="lang-toggle" type="button"></button>
+<div class="app">
+<nav class="sidebar">
+  <div class="nav-list">
+    <button data-view="health" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 10.5h3.4l2.2-5.6 3.8 10.4 2.3-4.8H18"/></svg><span data-i18n="nav.health">Status</span></button>
+    <button data-view="slots" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7h13M13 4l3 3-3 3M17 13H4M7 10l-3 3 3 3"/></svg><span data-i18n="nav.slots">Model mapping</span></button>
+    <button data-view="providers" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.2 15.5h8.1a3.3 3.3 0 0 0 .4-6.6 4.8 4.8 0 0 0-9.2-.8 3.7 3.7 0 0 0 .7 7.4z"/></svg><span data-i18n="nav.providers">Providers</span></button>
+    <button data-view="clients" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="13" height="9.5" rx="1.6"/><path d="M1.8 16.4h16.4"/></svg><span data-i18n="nav.clients">Clients</span></button>
+    <button data-view="phone" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="2" width="10" height="16" rx="2"/><path d="M8.5 14.8h3"/></svg><span data-i18n="nav.phone">Phone</span></button>
+    <button data-view="mac" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 13V5.6c0-.9.7-1.6 1.6-1.6h9.8c.9 0 1.6.7 1.6 1.6V13"/><path d="M1.8 15.8h16.4"/><path d="M10.8 6.2a2.4 2.4 0 1 0 2.2 3.5 1.9 1.9 0 0 1-2.2-3.5z" stroke-width="1.3"/></svg><span class="nav-long" data-i18n="nav.mac">Laptop</span><span class="nav-short" data-i18n="nav.macShort">Laptop</span></button>
+    <button data-view="mod" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6.5h8M14.5 6.5h3M2.5 13.5h3M9.5 13.5h8"/><circle cx="12.5" cy="6.5" r="2"/><circle cx="7.5" cy="13.5" r="2"/></svg><span class="nav-long" data-i18n="nav.mod">ClaudeRipple mod</span><span class="nav-short" data-i18n="nav.modShort">Mod</span></button>
+    <button data-view="logs" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.5 5.5H17M7.5 10H17M7.5 14.5H17"/><path d="M3.5 5.5h.01M3.5 10h.01M3.5 14.5h.01" stroke-width="2.4"/></svg><span data-i18n="nav.logs">Logs</span></button>
+    <button data-view="about" class="nav-btn" type="button"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="7.6"/><path d="M10 9.2v4.6"/><path d="M10 6.3h.01" stroke-width="2.2"/></svg><span data-i18n="nav.about">About</span></button>
+  </div>
+  <div class="sidebar-footer"><select class="lang-select" id="lang-toggle" data-i18n-title="lang.label"></select></div>
 </nav>
 
 <main>
   <section id="view-health" class="view">
-    <h1 data-i18n="health.title">Status</h1>
-    <p class="subtitle" data-i18n="health.subtitle">Check that Claude Desktop and your providers are ready.</p>
-    <div class="card"><h2 data-i18n="health.desktop">Claude Desktop connection</h2><div class="rows" id="health-desktop"></div></div>
-    <div class="card"><h2 data-i18n="health.providers">Providers</h2><div class="rows" id="health-providers"></div></div>
-    <div class="card"><h2 data-i18n="health.requestCount">Request count</h2><div class="rows" id="health-requests"></div></div>
-    <details class="details"><summary data-i18n="health.details">Details</summary><div class="rows detail-rows" id="health-details"></div></details>
+    <header class="page-header"><div><h1 data-i18n="health.title">Status</h1><p class="page-subtitle" data-i18n="health.subtitle"></p></div></header>
+    <!-- Drawn only inside the ClaudeRipple app, which can repair or switch the connection (window.rippleApp). -->
+    <div class="conn" id="health-connection" hidden></div>
+    <section class="section" id="health-desktop-section">
+      <div class="section-head"><h2 class="section-title" data-i18n="health.desktop">Claude Desktop connection</h2></div>
+      <div class="group" id="health-desktop"></div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="health.providers">Providers</h2></div>
+      <div class="group" id="health-providers"></div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="health.requestCount">Request count</h2></div>
+      <div class="group" id="health-requests"></div>
+    </section>
   </section>
 
   <section id="view-slots" class="view">
-    <h1 data-i18n="slots.title">Model links</h1>
-    <p class="subtitle" data-i18n="slots.subtitle">Choose what each Claude model should actually use.</p>
-    <div class="toolbar"><button class="btn secondary" id="slots-add" type="button" data-i18n="slots.add">+ Add link</button><span class="small" id="slots-status"></span></div>
-    <p class="small" id="slots-summary"></p>
-    <p class="hint" data-i18n="slots.effortHint">If the effort chosen in the app is unsupported by the model, ClaudeRipple sends the nearest level instead. (For example: xhigh → high)</p>
-    <div class="card table-card"><table id="slots-table"><thead><tr><th data-i18n="slots.th.claude">When you choose this</th><th data-i18n="slots.th.target">It answers with</th><th data-i18n="slots.th.effort">Thinking depth</th><th></th></tr></thead><tbody></tbody></table></div>
+    <header class="page-header">
+      <div><h1 data-i18n="slots.title">Model mapping</h1><p class="page-subtitle" data-i18n="slots.subtitle"></p></div>
+      <div class="page-actions"><span class="slots-status" id="slots-status" role="status"></span><button class="btn" id="slots-add" type="button" data-i18n="slots.add">+ Add mapping</button></div>
+    </header>
+    <section class="section">
+      <div class="map-head" aria-hidden="true"><span data-i18n="slots.th.claude"></span><span></span><span data-i18n="slots.th.target"></span><span data-i18n="slots.th.effort"></span><span></span></div>
+      <div class="group map-list" id="slots-list"></div>
+      <p class="group-footer" id="slots-summary"></p>
+      <p class="group-footer" data-i18n="slots.effortHint"></p>
+    </section>
   </section>
 
   <section id="view-providers" class="view providers-view">
-    <div class="page-heading">
-      <div><h1 data-i18n="providers.title">Providers</h1><p class="subtitle" data-i18n="providers.subtitle">Connect an AI account, then choose the models you will use.</p></div>
-      <button class="btn" id="providers-add" type="button" data-i18n="providers.add">+ Add provider</button>
-    </div>
+    <header class="page-header">
+      <div><h1 data-i18n="providers.title">Providers</h1><p class="page-subtitle" data-i18n="providers.subtitle"></p></div>
+      <div class="page-actions"><button class="btn" id="providers-add" type="button" data-i18n="providers.add">+ Add provider</button></div>
+    </header>
     <div class="provider-workspace">
-      <aside class="provider-rail" aria-label="Providers">
-        <div class="provider-rail-tools"><input id="providers-search" type="search" data-i18n-placeholder="providers.search" placeholder="Search providers…" /><button class="icon-btn" id="providers-refresh" type="button" data-i18n-title="providers.refresh" title="Check connections" aria-label="Check connections">↻</button></div>
-        <div id="providers-list" class="provider-list" role="listbox"></div>
+      <aside class="provider-rail">
+        <div class="provider-rail-tools">
+          <input id="providers-search" type="search" data-i18n-placeholder="providers.search" placeholder="Search providers…" />
+          <button class="icon-btn" id="providers-refresh" type="button" data-i18n-title="providers.refresh" title="Test all"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16.2 10a6.2 6.2 0 1 1-1.9-4.5"/><path d="M16.4 3.4v3.8h-3.8"/></svg></button>
+        </div>
+        <div id="providers-list" class="provider-list group" role="listbox"></div>
       </aside>
       <div id="provider-detail" class="provider-detail"></div>
     </div>
   </section>
 
   <section id="view-clients" class="view">
-    <h1 data-i18n="clients.title">Clients</h1>
-    <p class="subtitle" data-i18n="clients.subtitle">Set up the apps that use ClaudeRipple.</p>
-    <div class="card">
-      <h2 data-i18n="clients.desktop.title">Claude Desktop</h2>
-      <p class="hint" data-i18n="clients.desktop.help">Choose whether provider models appear by name in the model picker.</p>
-      <div class="rows" id="client-picker-rows"></div>
-      <div class="actions"><button class="btn" id="client-picker-toggle" type="button"></button><span class="small" id="client-picker-msg"></span></div>
-      <div class="client-models" id="client-picker-models-card" hidden><h3 data-i18n="slots.pickerModels">Models in picker</h3><p class="hint" data-i18n="slots.pickerModelsHelp">Tick only models you want to see in Claude Desktop.</p><div class="model-checklist" id="client-picker-models"></div></div>
-      <div class="client-divider"></div>
-      <h3 data-i18n="slots.modelSlots">Claude Code's own model slots</h3>
-      <p class="hint" data-i18n="slots.modelSlotsHelp"></p>
-      <div class="slot-rows" id="client-model-slots"></div>
-      <div class="client-divider"></div>
-      <h3 data-i18n="agentTitle.title">Subagent name tags</h3>
-      <p class="hint" data-i18n="agentTitle.help"></p>
-      <div class="rows" id="client-agent-title-rows"></div>
-      <div class="actions"><button class="btn" id="client-agent-title-toggle" type="button"></button></div>
-      <div class="client-divider"></div>
-      <h3 data-i18n="statusMod.title">Route line and request log</h3>
-      <p class="hint" data-i18n="statusMod.help"></p>
-      <div class="rows" id="client-status-mod-rows"></div>
-      <div class="actions"><button class="btn" id="client-status-mod-toggle" type="button"></button></div>
-      <div class="client-divider"></div>
-      <h3 data-i18n="workerTools.title">Worker tools</h3>
-      <p class="hint" data-i18n="workerTools.help"></p>
-      <div class="rows" id="client-worker-tools-rows"></div>
-      <div class="actions"><button class="btn" id="client-worker-tools-toggle" type="button"></button></div>
-    </div>
-    <div class="card">
-      <h2 data-i18n="clients.codex.title">Codex CLI</h2>
-      <p class="hint" data-i18n="clients.codex.help">Adds ClaudeRipple as a provider to Codex.</p>
-      <div class="rows" id="client-codex-rows"></div>
-      <div class="actions"><button class="btn" id="client-codex-toggle" type="button"></button><span class="small" id="client-codex-msg"></span></div>
-      <p class="hint" data-i18n="clients.codex.note">ChatGPT subscription models are used directly by Codex, so only Claude and Anthropic-compatible providers appear here.</p>
-    </div>
-    <div class="card">
-      <h2 data-i18n="clients.claudeCode.title">Terminal Claude Code</h2>
-      <p class="hint" data-i18n="clients.claudeCode.help">Terminal Claude uses the same router. Choose with /model &lt;name&gt;.</p>
-      <div class="rows" id="client-claude-code-rows"></div>
-    </div>
+    <header class="page-header"><div><h1 data-i18n="clients.title">Clients</h1><p class="page-subtitle" data-i18n="clients.subtitle"></p></div></header>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="clients.desktop.title">Claude Desktop</h2><span class="small" id="client-picker-msg" role="status"></span></div>
+      <div class="group" id="client-picker-rows">
+        <div class="cell">
+          <div class="cell-text"><label class="cell-label" for="client-picker-toggle" data-i18n="picker.title">Model picker</label><span class="cell-sub" data-i18n="clients.desktop.help"></span></div>
+          <span class="switch"><input type="checkbox" role="switch" id="client-picker-toggle" /><span></span></span>
+        </div>
+      </div>
+      <p class="group-footer" data-i18n="picker.restartHelp"></p>
+    </section>
+    <section class="section" id="client-picker-models-card" hidden>
+      <div class="section-head"><h2 class="section-title" data-i18n="slots.pickerModels">Models in picker</h2></div>
+      <div class="group"><div class="model-checklist" id="client-picker-models"></div></div>
+      <p class="group-footer" data-i18n="slots.pickerModelsHelp"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="slots.modelSlots">Claude Code's own model slots</h2></div>
+      <div class="group" id="client-model-slots"></div>
+      <p class="group-footer" data-i18n="slots.modelSlotsHelp"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="clients.claudeCode.extras">Claude Code add-ons</h2></div>
+      <div class="group">
+        <div class="cell">
+          <div class="cell-text"><label class="cell-label" for="client-status-mod-toggle" data-i18n="statusMod.title">Route line and request log</label></div>
+          <span class="switch"><input type="checkbox" role="switch" id="client-status-mod-toggle" /><span></span></span>
+        </div>
+        <a class="cell link" href="#mod">
+          <div class="cell-text"><span class="cell-label" data-i18n="mod.openSettings">ClaudeRipple mod settings</span></div>
+          <svg class="chevron" viewBox="0 0 8 13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1.5 1.5l5 5-5 5"/></svg>
+        </a>
+      </div>
+      <p class="group-footer" data-i18n="statusMod.help"></p>
+      <div class="group stacked-group">
+        <div class="cell">
+          <div class="cell-text"><label class="cell-label" for="client-worker-tools-toggle" data-i18n="workerTools.switch">Limit worker tools</label></div>
+          <span class="switch"><input type="checkbox" role="switch" id="client-worker-tools-toggle" /><span></span></span>
+        </div>
+      </div>
+      <p class="group-footer" data-i18n="workerTools.help"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="clients.codex.title">Codex</h2><span class="small" id="client-codex-msg" role="status"></span></div>
+      <div class="group">
+        <div class="cell">
+          <div class="cell-text"><label class="cell-label" for="client-codex-toggle" data-i18n="clients.codex.turnOn">Use ClaudeRipple in Codex</label><span class="cell-sub mono" id="client-codex-rows"></span></div>
+          <span class="switch"><input type="checkbox" role="switch" id="client-codex-toggle" /><span></span></span>
+        </div>
+      </div>
+      <p class="group-footer" data-i18n="clients.codex.help"></p>
+      <p class="group-footer" data-i18n="clients.codex.note"></p>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2 class="section-title" data-i18n="clients.claudeCode.title">Terminal Claude Code</h2></div>
+      <div class="group" id="client-claude-code-rows"></div>
+      <p class="group-footer" data-i18n="clients.claudeCode.help"></p>
+    </section>
+  </section>
+
+  <section id="view-phone" class="view">
+    <header class="page-header"><div><h1 data-i18n="nav.phone">Phone</h1><p class="page-subtitle" data-i18n="phone.subtitle"></p></div><button id="phone-refresh" class="btn secondary" type="button" data-i18n="phone.refresh">Refresh</button></header>
+    <div id="phone-content"></div>
+  </section>
+
+  <section id="view-mac" class="view">
+    <header class="page-header"><div><h1 data-i18n="mac.title">Laptop</h1><p class="page-subtitle" data-i18n="mac.subtitle"></p></div></header>
+    <div id="mac-content"></div>
+  </section>
+
+  <section id="view-mod" class="view">
+    <header class="page-header">
+      <div><h1 data-i18n="nav.mod">ClaudeRipple mod</h1><p class="page-subtitle" data-i18n="mod.subtitle"></p></div>
+      <div class="page-actions"><span class="slots-status" id="mod-status" role="status"></span></div>
+    </header>
+    <section class="section" id="mod-notice" hidden></section>
+    <div id="mod-content"></div>
   </section>
 
   <section id="view-logs" class="view">
-    <h1 data-i18n="logs.title">Logs</h1>
-    <div class="logs-tabs" role="tablist">
-      <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" data-i18n="logs.requests">Requests</button>
-      <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" data-i18n="logs.raw">Raw logs</button>
-    </div>
-    <div id="logs-requests-panel" role="tabpanel">
-      <div class="logs-summary-title"><strong data-i18n="logs.lastHour">Last hour</strong><span class="small" data-i18n="logs.polling">Updates every 3s</span></div>
-      <div class="logs-summary" id="logs-summary"></div>
-      <div class="toolbar logs-controls">
-        <label class="logs-filter"><span data-i18n="logs.provider">Provider</span><select id="logs-provider"><option value="" data-i18n="logs.all">All</option></select></label>
+    <header class="page-header">
+      <div><h1 data-i18n="logs.title">Logs</h1></div>
+      <div class="logs-tabs" role="tablist">
+        <button class="logs-tab active" id="logs-requests-tab" type="button" role="tab" aria-selected="true" data-i18n="logs.requests">Requests</button>
+        <button class="logs-tab" id="logs-raw-tab" type="button" role="tab" aria-selected="false" data-i18n="logs.raw">Raw logs</button>
       </div>
-      <div class="card table-card logs-table-card"><table id="requests-table"><thead><tr><th data-i18n="logs.th.time">Time</th><th data-i18n="logs.th.models">Called → answered</th><th data-i18n="logs.th.effort">effort</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.duration">Duration</th><th data-i18n="logs.th.status">Status</th></tr></thead><tbody></tbody></table></div>
-      <div class="empty-card" id="requests-empty" hidden data-i18n="logs.empty">No requests yet.</div>
+    </header>
+    <div id="logs-requests-panel" role="tabpanel">
+      <section class="section">
+        <div class="logs-header-row">
+          <div><h2 class="section-title" data-i18n="logs.usage">Usage</h2><span class="small" id="logs-range-caption"></span></div>
+          <label class="logs-filter"><span data-i18n="logs.provider">Provider</span><select id="logs-provider"><option value="" data-i18n="logs.all">All</option></select></label>
+        </div>
+        <div class="logs-period-row">
+          <div class="segmented logs-period" id="logs-period" role="radiogroup" data-i18n-title="logs.period"></div>
+          <div class="logs-custom" id="logs-custom" hidden>
+            <input type="date" id="logs-from" data-i18n-title="logs.customFrom" />
+            <span class="logs-custom-dash" aria-hidden="true">–</span>
+            <input type="date" id="logs-to" data-i18n-title="logs.customTo" />
+          </div>
+        </div>
+        <div class="group logs-summary" id="logs-summary"></div>
+      </section>
+      <section class="section">
+        <div class="logs-header-row"><h2 class="section-title" data-i18n="logs.byModel">Usage by model</h2></div>
+        <div class="group logs-table-card"><table id="models-table"><thead><tr><th data-i18n="logs.th.models">Model</th><th data-i18n="logs.th.count">Requests</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.avg">Avg. duration</th></tr></thead><tbody></tbody></table></div>
+        <div class="group empty-card" id="models-empty" hidden data-i18n="logs.modelsEmpty">No usage in this period.</div>
+      </section>
+      <section class="section">
+        <div class="logs-header-row"><div><h2 class="section-title" data-i18n="logs.recent">Recent requests</h2><span class="small" data-i18n="logs.recentNote">Last 200</span></div></div>
+        <div class="group logs-table-card"><table id="requests-table"><thead><tr><th data-i18n="logs.th.time">Time</th><th data-i18n="logs.th.models">Model</th><th data-i18n="logs.th.effort">effort</th><th data-i18n="logs.th.input">Input</th><th data-i18n="logs.th.output">Output</th><th data-i18n="logs.th.duration">Duration</th><th data-i18n="logs.th.status">Status</th></tr></thead><tbody></tbody></table></div>
+        <div class="group empty-card" id="requests-empty" hidden data-i18n="logs.empty">No requests yet.</div>
+      </section>
     </div>
     <div id="logs-raw-panel" role="tabpanel" hidden>
-      <div class="toolbar"><label class="check"><input type="checkbox" id="logs-autoscroll" checked /><span data-i18n="logs.autoscroll">Auto-scroll</span></label><span class="small" data-i18n="logs.rawPolling">Updates every 3s · last 200 lines</span></div>
-      <pre id="logbox"></pre>
+      <div class="raw-toolbar"><span class="small" data-i18n="logs.rawPolling">Updates every 3s · last 200 lines</span><label class="check"><input type="checkbox" id="logs-autoscroll" checked /><span data-i18n="logs.autoscroll">Auto-scroll</span></label></div>
+      <div class="group"><pre id="logbox"></pre></div>
     </div>
   </section>
 
   <section id="view-about" class="view">
-    <h1 data-i18n="about.title">About</h1>
-    <div class="card"><p data-i18n="about.body">ClaudeRipple is an independent open-source project, not affiliated with Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC.</p><p class="small" data-i18n="about.license">License: GPL-3.0</p></div>
+    <header class="page-header"><div><h1 data-i18n="about.title">About</h1></div></header>
+    <section class="section">
+      <div class="group" id="health-details"></div>
+    </section>
+    <section class="section narrow-only">
+      <div class="group">
+        <div class="cell">
+          <div class="cell-text"><span class="cell-label" data-i18n="lang.label">Language</span></div>
+          <div class="cell-value"><select class="lang-select" id="lang-about" data-i18n-title="lang.label"></select></div>
+        </div>
+      </div>
+    </section>
+    <section class="section">
+      <div class="group about-text"><p data-i18n="about.body">ClaudeRipple is an independent open-source project, not affiliated with Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC.</p><p class="small" data-i18n="about.license">License: GPL-3.0</p></div>
+    </section>
   </section>
 </main>
+</div>
 
-<div class="toast" id="toast" role="status"></div>
-<div class="modal-backdrop" id="modal-backdrop" hidden><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="icon-btn modal-close" id="modal-close" type="button" aria-label="Close">×</button><div id="modal-content"></div></section></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="modal-backdrop" id="modal-backdrop" hidden><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="icon-btn modal-close" id="modal-close" type="button" data-i18n-title="common.close" aria-label="Close"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></button><div id="modal-content"></div></section></div>
 
 <script src="i18n.js"></script>
 <script src="presets-fallback.js"></script>

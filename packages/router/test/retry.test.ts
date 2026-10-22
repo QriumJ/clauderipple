@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
-import { fetchWithRetry } from "../src/providers/retry.ts";
+import { allowLongSilences, fetchWithRetry } from "../src/providers/retry.ts";
 
 /** A server that answers from a script, recording how many times it was asked. */
 async function server(replies: { status: number; body?: string }[]): Promise<{ url: string; calls: () => number; close: () => Promise<void> }> {
@@ -112,4 +112,42 @@ test("an abort during backoff stops before the next attempt", async () => {
     );
     assert.equal(s.calls(), 1, "the abandoned turn is not kept alive through backoff");
   } finally { await s.close(); }
+});
+
+test("stopOn hands back a 5xx it names at once, with its body intact; other 5xx keep the ladder", async () => {
+  const marked = JSON.stringify({ error: { code: 503, details: [{ reason: "MARKED" }] } });
+  const stopOn = (status: number, text: string): boolean => status === 503 && text.includes("MARKED");
+  const s = await server([{ status: 503, body: marked }, { status: 200 }]);
+  try {
+    const res = await fetchWithRetry(s.url, { method: "POST", body: "{}" }, { ...opts, stopOn });
+    assert.equal(res.status, 503);
+    assert.equal(await res.text(), marked, "the caller still reads the body the hook read");
+    assert.equal(s.calls(), 1);
+  } finally { await s.close(); }
+  const plain = await server([{ status: 503, body: "{}" }, { status: 200 }]);
+  try {
+    const res = await fetchWithRetry(plain.url, { method: "POST", body: "{}" }, { ...opts, stopOn });
+    assert.equal(res.status, 200);
+    assert.equal(plain.calls(), 2, "an unmarked 503 is retried exactly as without the hook");
+  } finally { await plain.close(); }
+});
+
+test("allowLongSilences sets how long the global fetch waits between body bytes", async () => {
+  // A stream that says one event and then nothing for 1.5s: a reasoning model thinking.
+  const quiet = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("event: response.created\ndata: {}\n\n");
+    setTimeout(() => res.end("event: response.completed\ndata: {}\n\n"), 1_500);
+  });
+  await new Promise<void>((resolve) => quiet.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(quiet.address() as { port: number }).port}/`;
+  try {
+    allowLongSilences(500);
+    await assert.rejects(async () => { await (await fetch(url)).text(); }, (e: Error & { cause?: { code?: string } }) => e.cause?.code === "UND_ERR_BODY_TIMEOUT");
+    allowLongSilences(5_000);
+    assert.match(await (await fetch(url)).text(), /response\.completed/);
+  } finally {
+    allowLongSilences();
+    await new Promise<void>((resolve) => quiet.close(() => resolve()));
+  }
 });

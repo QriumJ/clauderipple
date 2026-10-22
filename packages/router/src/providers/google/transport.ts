@@ -13,6 +13,7 @@
 
 import type { GeminiRequest } from "./translate.ts";
 import { antigravityRequestId, antigravitySessionId, antigravityUserAgent, GOOGLE_OAUTH, resolveAntigravityWireModel } from "./antigravity.ts";
+import { VERSION } from "../../version.ts";
 
 export type GoogleTransportRequest = { url: string; headers: Record<string, string>; body: string };
 
@@ -25,6 +26,17 @@ export type GoogleTransportBuildOptions = {
   effort?: string;
   /** Present only for the antigravity mode; the api-key mode ignores it. */
   antigravity?: AntigravityAuth;
+  /**
+   * The conversation this turn belongs to, for the api-key mode's `sessionHeader`. The caller
+   * already computes it (`conversationKey`), so it is passed in rather than derived from the body
+   * again. Absent, no session header is sent.
+   */
+  conversationKey?: string;
+  /**
+   * The Cloud Code Assist host this turn goes to, when the adapter has resolved one (a model that
+   * only one of daily/prod offers). Absent means the transport's own base.
+   */
+  antigravityBaseUrl?: string;
 };
 
 export type GoogleTransport = {
@@ -57,7 +69,7 @@ export function antigravityBaseUrl(configured?: string): string {
   return (configured?.trim() || GOOGLE_OAUTH.dailyApi).replace(/\/+$/, "");
 }
 
-export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?: string; url?: string }): GoogleTransport {
+export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?: string; url?: string; sessionHeader?: string; headers?: Record<string, string> }): GoogleTransport {
   if (mode === "antigravity") {
     const base = antigravityBaseUrl(opts.url);
     return {
@@ -101,7 +113,7 @@ export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?
           request,
         };
         return {
-          url: `${base}/${GOOGLE_OAUTH.apiVersion}:${method}${query}`,
+          url: `${(o.antigravityBaseUrl ? o.antigravityBaseUrl.replace(/\/+$/, "") : base)}/${GOOGLE_OAUTH.apiVersion}:${method}${query}`,
           headers: {
             "content-type": "application/json",
             accept: o.stream ? "text/event-stream" : "application/json",
@@ -122,6 +134,12 @@ export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?
   }
   const base = googleBaseUrl(opts.url);
   const apiKey = resolveApiKey(opts.apiKey);
+  // A provider that asks for a conversation header is not AI Studio; it is a relay such as OpenCode
+  // Go, which also asks clients to name themselves with a distinctive User-Agent rather than an
+  // SDK/library one (https://opencode.ai/docs/go/, read 2026-10-21). Plain AI Studio requests keep
+  // the client's own User-Agent, so nothing about this changes for them.
+  const sessionHeader = opts.sessionHeader?.trim() || undefined;
+  const userAgent = sessionHeader ? `clauderipple/${VERSION}` : undefined;
   return {
     kind: "api-key",
     build(req, o) {
@@ -130,7 +148,15 @@ export function createTransport(mode: "api-key" | "antigravity", opts: { apiKey?
       const query = o.stream ? "?alt=sse" : "";
       return {
         url: `${base}/v1beta/models/${encodeURIComponent(o.model)}:${method}${query}`,
-        headers: { "content-type": "application/json", accept: o.stream ? "text/event-stream" : "application/json", "x-goog-api-key": apiKey },
+        headers: {
+          "content-type": "application/json",
+          accept: o.stream ? "text/event-stream" : "application/json",
+          ...(userAgent ? { "user-agent": userAgent } : {}),
+          ...(sessionHeader && o.conversationKey ? { [sessionHeader]: o.conversationKey } : {}),
+          ...(opts.headers ?? {}),
+          // Kept after the vendor's own headers so nothing can shadow the credential on this wire.
+          "x-goog-api-key": apiKey,
+        },
         body: JSON.stringify(req),
       };
     },

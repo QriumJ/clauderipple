@@ -5,11 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { retitle, claudePretty, fromMarker } from "../src/hooks/agent-title.ts";
+import { retitle, claudePretty, fromMarker, shortName } from "../src/hooks/agent-title.ts";
 import { setAgentTitleHook, agentTitleHookEnabled } from "../src/settings.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const NAMES = { names: { "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol" } };
+
+test("short name: the display name's last word, without a hosted id's vendor path", () => {
+  assert.equal(shortName("GPT-6.1 Sol"), "Sol");
+  assert.equal(shortName("deepseek-ai/deepseek-v4.1-flash-1017"), "deepseek-v4.1-flash-1017");
+});
 
 test("marker wins, agent file next, claude alias otherwise", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-agents-"));
@@ -24,6 +29,8 @@ test("marker wins, agent file next, claude alias otherwise", () => {
   assert.equal(retitle({ ...base, tool_input: { description: "Sol·low · Do X", prompt: "hi", subagent_type: "gpt" } }, [dir], NAMES)!.description, "Terra·high · Do X", "stale prefix replaced");
   assert.equal(retitle({ tool_name: "Bash", tool_input: { description: "x" } }, [dir], NAMES), null);
   assert.equal(claudePretty("claude-haiku-4-5-20251001"), "Haiku4.5");
+  assert.equal(claudePretty("claude-mythos-5-1"), "Mythos5.1");
+  assert.equal(claudePretty("mythos"), "Mythos");
   assert.deepEqual(fromMarker("<system-reminder>r</system-reminder>\n[[ripple: Luna@max]]\nx"), { name: "luna", effort: "max" });
   assert.equal(fromMarker("x\n[[ripple: luna@max]]"), null);
 });

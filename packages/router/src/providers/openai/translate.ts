@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { clampEffort } from "../../compat.ts";
 import { conversationKey, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool } from "../chatgpt/translate.ts";
 import { identityPrefix, instructionsSuffix } from "../../identity.ts";
+import { encodeEnvelope, envelopeFor, replayableReasoning, type Envelope, type ReplayedReasoning } from "../../reasoning.ts";
 
 export type OpenAiWire = "chat" | "responses";
 export type OpenAiCaps = { effortLevels?: string[]; reasoning?: "effort" | "none" };
@@ -19,6 +20,29 @@ export type OpenAiTranslateOptions = {
   identity?: boolean;
   /** Fixed configured text after the system prompt. */
   instructionsAppend?: string;
+  /**
+   * Carry the conversation's reasoning back to a reasoning model (see reasoning.ts). Default true:
+   * a Chat vendor that requires `reasoning_content` back answers a 400 without it (DeepSeek,
+   * measured from its own docs 2026-10-14), and one that ignores it is not harmed by it. A false
+   * value is the retry after a vendor refused the request that carried it.
+   */
+  replay?: boolean;
+  /**
+   * The provider and model this request is going to. Reasoning is only replayed into the model that
+   * made it — a blob sealed by another one is the thing a 400 is reliably about (reasoning.ts).
+   */
+  env?: { p: string; m: string };
+  /** The provider's preset measured that it seals reasoning on request (presets.ts `sealedReasoning`). */
+  sealedReasoning?: boolean;
+  /** Filled in as the input is built: how many reasonings were replayed, and how many were not. */
+  carried?: { replayed: number; undecodable: number };
+  /** Names the reason a carrier was dropped. Absent in tests, where the counts are enough. */
+  log?: (line: string) => void;
+  /**
+   * Called as each replayed item is placed, with the tool call it arrived immediately after. The
+   * response path uses that to know where to address the next turn's reasoning for that turn.
+   */
+  onArrival?: (item: ReplayedReasoning, afterCallId: string | undefined) => void;
 };
 
 type ChatTextPart = { type: "text"; text: string };
@@ -28,12 +52,27 @@ type ChatMessage = {
   content: string | (ChatTextPart | ChatImagePart)[] | null;
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
+  /**
+   * The reasoning a vendor sent on an earlier turn, replayed on the assistant message it belongs to.
+   * The field name is the vendor's own: `reasoning_content` is what DeepSeek documents and requires
+   * back, `reasoning` is what a few relays use (reasoning.ts).
+   */
+  reasoning_content?: string;
+  reasoning?: string;
 };
+
+/** Counts a replay outcome, creating the tally the adapter reports from when it is the first. */
+function bump(opts: OpenAiTranslateOptions | undefined, kind: "replayed" | "undecodable", by = 1): void {
+  if (!opts) return;
+  const carried = opts.carried ?? (opts.carried = { replayed: 0, undecodable: 0 });
+  carried[kind] += by;
+}
 
 type ResponseInput =
   | { type: "message"; role: "user" | "assistant"; content: ({ type: "input_text" | "output_text"; text: string } | { type: "input_image"; image_url: string })[] }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
-  | { type: "function_call_output"; call_id: string; output: string };
+  | { type: "function_call_output"; call_id: string; output: string }
+  | ReplayedReasoning;
 
 type OpenAiTool = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } };
 type ResponsesTool = { type: "function"; name: string; description: string; parameters: Record<string, unknown> };
@@ -61,7 +100,13 @@ export type ResponsesRequest = {
   parallel_tool_calls?: boolean;
   max_output_tokens?: number;
   temperature?: number;
-  reasoning?: { effort: string };
+  reasoning?: { effort: string; summary?: "auto" };
+  /**
+   * What asks a stateless Responses deployment to hand its reasoning over sealed, so the
+   * conversation can carry it back (reasoning.ts). Sent on every turn to a `sealedReasoning` preset;
+   * to anyone else only once the conversation already carries their reasoning.
+   */
+  include?: "reasoning.encrypted_content"[];
   stream: true;
 };
 
@@ -157,6 +202,14 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
     if (role === "assistant") {
       const text: string[] = [];
       const calls: NonNullable<ChatMessage["tool_calls"]> = [];
+      // The reasoning this turn came back with, rejoined into one string and sent as
+      // `reasoning_content` on the same assistant message — the shape DeepSeek's own example builds
+      // by appending the whole response message, and the only shape its API documents. The field
+      // name is the one the vendor sent it under, carried in the envelope: a model heard on
+      // `reasoning` is answered on `reasoning` (reasoning.ts).
+      const reasoning: string[] = [];
+      let field: "reasoning_content" | "reasoning" = "reasoning_content";
+      let carriedHere = 0;
       for (const block of message.content) {
         if (block.type === "text") text.push(String((block as { text?: unknown }).text ?? ""));
         if (block.type === "tool_use") {
@@ -164,8 +217,27 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
           knownCalls.add(call.id);
           calls.push({ id: call.id, type: "function", function: { name: toolNameForResponses(call.name), arguments: typeof call.input === "string" ? call.input : JSON.stringify(call.input ?? {}) } });
         }
+        const envelope = envelopeFor(block, "chat", opts?.env, (reason) => {
+          bump(opts, "undecodable");
+          if (opts?.replay !== false) opts?.log?.(`dropped a reasoning carrier: ${reason}`);
+        });
+        if (!envelope || opts?.replay === false) continue;
+        const held = (block as { thinking?: unknown }).thinking;
+        if (typeof held === "string" && held.length > 0) reasoning.push(held);
+        field = envelope.f === "reasoning" ? "reasoning" : "reasoning_content";
+        carriedHere++;
       }
-      if (text.some(Boolean) || calls.length) messages.push({ role: "assistant", content: text.join("\n") || null, ...(calls.length ? { tool_calls: calls } : {}) });
+      if (carriedHere > 0) bump(opts, "replayed", carriedHere);
+      // A turn whose only content was reasoning is still a turn the model had: it goes out with the
+      // reasoning alone rather than vanishing, which is what dropping thinking did before.
+      if (text.some(Boolean) || calls.length || reasoning.length) {
+        messages.push({
+          role: "assistant",
+          content: text.join("\n") || null,
+          ...(calls.length ? { tool_calls: calls } : {}),
+          ...(reasoning.length ? (field === "reasoning" ? { reasoning: reasoning.join("\n\n") } : { reasoning_content: reasoning.join("\n\n") }) : {}),
+        });
+      }
       continue;
     }
 
@@ -176,11 +248,21 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
       messages.push({ role: "user", content: onlyText ? parts.map((part) => (part as ChatTextPart).text).join("\n") : parts });
       parts = [];
     };
+    // A tool result's images (and the fallback text of an unknown call) wait until the run of tool
+    // results ends: every `tool` message must follow the assistant's tool_calls directly, and a user
+    // message between parallel results is refused (DeepSeek: "insufficient tool messages", #64).
+    let deferred: (ChatTextPart | ChatImagePart)[] = [];
+    const release = (): void => {
+      parts.push(...deferred);
+      deferred = [];
+    };
     for (const block of message.content) {
       if (block.type === "text") {
+        release();
         const text = String((block as { text?: unknown }).text ?? "");
         if (text) parts.push({ type: "text", text });
       } else if (block.type === "image") {
+        release();
         const url = imageUrl(block);
         if (url) parts.push({ type: "image_url", image_url: { url } });
       } else if (block.type === "tool_result") {
@@ -191,19 +273,27 @@ export function toChatMessages(req: AnthropicRequest, opts?: OpenAiTranslateOpti
         if (result.is_error && !output) output = "Tool execution failed";
         if (!output && images.length > 0) output = "Tool returned image content.";
         if (knownCalls.has(result.tool_use_id)) messages.push({ role: "tool", tool_call_id: result.tool_use_id, content: output });
-        else parts.push({ type: "text", text: `[Tool result]\n${output}` });
-        for (const url of images) parts.push({ type: "image_url", image_url: { url } });
+        else deferred.push({ type: "text", text: `[Tool result]\n${output}` });
+        for (const url of images) deferred.push({ type: "image_url", image_url: { url } });
       }
     }
+    release();
     flush();
   }
   return messages;
 }
 
 /** Translate to the stateless OpenAI Responses input grammar. */
-export function toResponsesInput(req: AnthropicRequest): ResponseInput[] {
+export function toResponsesInput(req: AnthropicRequest, opts?: OpenAiTranslateOptions): ResponseInput[] {
   const input: ResponseInput[] = [];
   const knownCalls = new Set<string>();
+  let lastCallId: string | undefined;
+  // A translation with no options is a translation with nothing to say about reasoning: there is no
+  // provider to name in an envelope and no model to check it against, so nothing is carried either
+  // way. `opts` is only consulted when it is there.
+  const carried = (count: "replayed" | "undecodable"): void => {
+    bump(opts, count);
+  };
   for (const message of req.messages) {
     const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
     if (typeof message.content === "string") {
@@ -217,6 +307,24 @@ export function toResponsesInput(req: AnthropicRequest): ResponseInput[] {
       parts = [];
     };
     for (const block of message.content) {
+      // A reasoning item this conversation came back with, in the position it was replayed from —
+      // beside the function calls of that turn, and never for the other wire's carrier (reasoning.ts).
+      const envelope = envelopeFor(block, "responses", opts?.env, (reason) => {
+        carried("undecodable");
+        if (opts?.replay !== false) opts?.log?.(`dropped a reasoning carrier: ${reason}`);
+      });
+      if (envelope) {
+        if (opts?.replay !== false) {
+          const item = replayableReasoning(envelope.r);
+          if (item) {
+            flush();
+            input.push(item);
+            carried("replayed");
+            opts?.onArrival?.(item, lastCallId);
+          } else carried("undecodable");
+        }
+        continue;
+      }
       if (block.type === "text") {
         const text = String((block as { text?: unknown }).text ?? "");
         if (text) parts.push({ type: role === "user" ? "input_text" : "output_text", text });
@@ -227,6 +335,7 @@ export function toResponsesInput(req: AnthropicRequest): ResponseInput[] {
         flush();
         const call = block as { id: string; name: string; input: unknown };
         knownCalls.add(call.id);
+        lastCallId = call.id;
         input.push({ type: "function_call", call_id: call.id, name: toolNameForResponses(call.name), arguments: typeof call.input === "string" ? call.input : JSON.stringify(call.input ?? {}) });
       } else if (block.type === "tool_result") {
         flush();
@@ -270,11 +379,17 @@ export function toOpenAiRequest(req: AnthropicRequest, opts: OpenAiTranslateOpti
   }
 
   const responseTools: ResponsesTool[] = tools.map(({ function: fn }) => ({ type: "function", ...fn }));
+  const input = toResponsesInput(req, opts);
   const out: ResponsesRequest = {
     model: opts.model,
-    input: toResponsesInput(req),
+    input,
     stream: true,
   };
+  // A vendor marked `sealedReasoning` is asked for its reasoning on every turn, the way OpenCode's own
+  // client asks: asking only once a conversation already carried some would never start one on a
+  // vendor that seals nothing unasked. Anyone else is asked only when the conversation is already
+  // carrying its reasoning, so a request for a vendor never measured stays as it was.
+  if (opts.replay !== false && (opts.sealedReasoning || input.some((item) => item.type === "reasoning"))) out.include = ["reasoning.encrypted_content"];
   const instructions = systemWithIdentity(systemWithDroppedToolNote(req), opts);
   if (instructions) out.instructions = instructions;
   if (responseTools.length) {
@@ -290,7 +405,7 @@ export function toOpenAiRequest(req: AnthropicRequest, opts: OpenAiTranslateOpti
   // floor rather than pass the refusal on — a cap is a limit, and a larger one still obeys it.
   if (typeof req.max_tokens === "number") out.max_output_tokens = Math.max(16, req.max_tokens);
   if (typeof req.temperature === "number") out.temperature = req.temperature;
-  if (effort) out.reasoning = { effort };
+  if (effort) out.reasoning = opts.sealedReasoning && opts.replay !== false ? { effort, summary: "auto" } : { effort };
   return out;
 }
 
@@ -303,34 +418,46 @@ type TextOutputBlock = { type: "text"; text: string };
 // `content` rather than inside it. Dropping it cost the turn its whole visible middle: measured
 // 2026-09-22, mimo-v2.6-pro at effort=high spent 43s emitting nothing else, so Claude Code showed a
 // blank screen for the whole turn, and one turn that reasoned without concluding arrived empty.
-type ThinkingOutputBlock = { type: "thinking"; thinking: string };
+type ThinkingOutputBlock = { type: "thinking"; thinking: string; signature?: string };
 type ToolOutputBlock = { type: "tool_use"; id: string; name: string; input: unknown; args: string; index: number };
 type OutputBlock = TextOutputBlock | ThinkingOutputBlock | ToolOutputBlock;
 type OpenBlock = { kind: "text" | "thinking" | "tool"; index: number; toolIndex?: number };
 type ResponseItem = {
   id: string;
-  kind: "text" | "tool";
+  kind: "text" | "tool" | "reasoning";
   block: OutputBlock;
   done: boolean;
   emitted: boolean;
   closed: boolean;
   emittedText: number;
 };
+/** A Responses reasoning item, as it arrives and as it is sealed for the client (reasoning.ts). */
+type ReasoningItem = { id?: string; encrypted?: string; summary: unknown; text: string };
 
 /** Maps standard OpenAI Chat Completion and Responses SSE records to Anthropic Messages SSE. */
 export class OpenAiStreamMapper {
   private started = false;
   private finished = false;
   private blockIndex = -1;
-  private open: OpenBlock | null = null;
+  /** `block` is the content entry this block writes into; `signature` seals a Responses item. */
+  private open: (OpenBlock & { signature?: string; block?: OutputBlock }) | null = null;
   private sawTool = false;
   private finishReason: string | undefined;
   private readonly responseItems: ResponseItem[] = [];
   private readonly responseItemsById = new Map<string, ResponseItem>();
+  /** Reasoning items of a Responses stream, by item id, until the item that carries one is done. */
+  private readonly reasoningItems = new Map<string, ReasoningItem>();
+  /** The item id of the most recent function_call, which is what a following reasoning describes. */
+  private lastCallId: string | undefined;
+  /** The field a Chat vendor's reasoning arrived under; the same one it is replayed under. */
+  private chatReasoningField: "reasoning_content" | "reasoning" = "reasoning_content";
   readonly messageId = `msg_${crypto.randomBytes(12).toString("hex")}`;
+  servedTier: string | undefined;
   readonly content: OutputBlock[] = [];
   usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   stopReason: "end_turn" | "tool_use" | "max_tokens" = "end_turn";
+  /** How many reasoning items this response handed over whole. The `reasoning=` figure in the log. */
+  reasoningCount = 0;
 
   readonly model: string;
   private readonly startInput: number;
@@ -338,10 +465,23 @@ export class OpenAiStreamMapper {
   /** Mangled tool name → the name Claude Code knows, from `toolNameRestoreMap`. */
   private readonly toolNames: ReadonlyMap<string, string>;
 
-  constructor(model: string, startInput = 0, toolNames: ReadonlyMap<string, string> = new Map()) {
+  /** What goes in each envelope: the provider and model this stream is going to (reasoning.ts). */
+  private readonly env: { p: string; m: string };
+
+  /**
+   * The wire this stream is on. It is fixed for the mapper's life — the adapter knows it before the
+   * first event. Decides what a closing block does: on Chat the block itself is the carrier.
+   */
+  wire: OpenAiWire = "chat";
+
+  /** Applied to every error message before it is stored or sent. */
+  redactError: (message: string) => string = (message) => message;
+
+  constructor(model: string, startInput = 0, toolNames: ReadonlyMap<string, string> = new Map(), env: { p: string; m: string } = { p: "", m: "" }) {
     this.model = model;
     this.startInput = startInput;
     this.toolNames = toolNames;
+    this.env = { p: env.p, m: env.m || model };
   }
 
   get isFinished(): boolean { return this.finished; }
@@ -356,7 +496,7 @@ export class OpenAiStreamMapper {
   private sawCompletion = false;
 
   /** The error `fail` reported, so a non-streaming caller can answer with it instead of a 200. */
-  failure: { type: string; message: string } | undefined;
+  failure: { type: string; message: string; code?: string } | undefined;
 
   start(): AnthropicEvent[] {
     if (this.started) return [];
@@ -364,17 +504,38 @@ export class OpenAiStreamMapper {
     return [{ event: "message_start", data: { type: "message_start", message: { id: this.messageId, type: "message", role: "assistant", model: this.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: this.startInput, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } }];
   }
 
+  /**
+   * Close the block that is open, writing any envelope it carries as a `signature_delta` first — last
+   * in the block, after all of its text, the order Anthropic's own thinking blocks use.
+   *
+   * A Chat reasoning block is sealed here, because only now is its text whole; a Responses one was
+   * sealed by its item (see `sealReasoningItem`) before this is reached, so it never gets here
+   * unsigned.
+   */
   private closeBlock(): AnthropicEvent[] {
     if (!this.open) return [];
-    const index = this.open.index;
+    const { index, kind, block } = this.open;
+    let signature = this.open.signature;
+    if (signature === undefined && kind === "thinking" && this.wire === "chat") {
+      signature = this.signatureForChat(block);
+    }
     this.open = null;
-    return [{ event: "content_block_stop", data: { type: "content_block_stop", index } }];
+    const out: AnthropicEvent[] = [];
+    if (signature !== undefined) out.push({ event: "content_block_delta", data: { type: "content_block_delta", index, delta: { type: "signature_delta", signature } } });
+    out.push({ event: "content_block_stop", data: { type: "content_block_stop", index } });
+    return out;
   }
 
-  private openBlock(kind: "text" | "thinking" | "tool", contentBlock: Record<string, unknown>, toolIndex?: number): AnthropicEvent[] {
+  /**
+   * `block` is the caller's entry in `this.content` for this block, when it has one. It is held here
+   * rather than found as the last entry, because a Chat caller pushes the entry it is about to open
+   * *before* calling this — which would close the block against the wrong entry.
+   */
+  private openBlock(kind: "text" | "thinking" | "tool", contentBlock: Record<string, unknown>, toolIndex?: number, block?: OutputBlock): AnthropicEvent[] {
     const out = this.closeBlock();
     const index = ++this.blockIndex;
-    this.open = { kind, index, ...(toolIndex === undefined ? {} : { toolIndex }) };
+    if (block !== undefined) this.content.push(block);
+    this.open = { kind, index, ...(toolIndex === undefined ? {} : { toolIndex }), ...(block === undefined ? {} : { block }) };
     out.push({ event: "content_block_start", data: { type: "content_block_start", index, content_block: contentBlock } });
     return out;
   }
@@ -411,31 +572,38 @@ export class OpenAiStreamMapper {
 
   private feedChat(ev: Record<string, unknown>): AnthropicEvent[] {
     const out = [...this.start()];
+    if (typeof ev.service_tier === "string") this.servedTier = ev.service_tier;
     const usage = ev.usage;
     if (usage) this.setUsage(usage);
     const choices = Array.isArray(ev.choices) ? ev.choices as { delta?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown; tool_calls?: unknown }; finish_reason?: unknown }[] : [];
     for (const choice of choices) {
       const delta = choice.delta ?? {};
       // Thinking arrives before the answer, so it opens the first block of the turn. `reasoning` is
-      // accepted alongside `reasoning_content` because vendors on this wire disagree on the name.
-      const reasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content ? delta.reasoning_content
-        : typeof delta.reasoning === "string" && delta.reasoning ? delta.reasoning : "";
+      // accepted alongside `reasoning_content` because vendors on this wire disagree on the name;
+      // the name it arrived under is remembered, because the same name is what the reasoning has to
+      // be replayed under on the next turn (reasoning.ts).
+      const field = typeof delta.reasoning_content === "string" && delta.reasoning_content ? "reasoning_content"
+        : typeof delta.reasoning === "string" && delta.reasoning ? "reasoning" : null;
+      const reasoning = field === "reasoning_content" ? delta.reasoning_content as string : field === "reasoning" ? delta.reasoning as string : "";
+      if (field) this.chatReasoningField = field;
       if (reasoning) {
         if (!this.open || this.open.kind !== "thinking") {
-          this.content.push({ type: "thinking", thinking: "" });
-          out.push(...this.openBlock("thinking", { type: "thinking", thinking: "" }));
+          // A Chat model's reasoning has no sealed blob to resume from, so the carrier is the block
+          // itself: the block's text is the reasoning to replay, and its signature is the envelope
+          // naming the field to replay it under (reasoning.ts). It is sealed when the block closes,
+          // so the envelope is built once the whole string has arrived (see `signatureForChat`).
+          out.push(...this.openBlock("thinking", { type: "thinking", thinking: "" }, undefined, { type: "thinking", thinking: "" }));
         }
-        const last = this.content[this.content.length - 1];
-        if (last?.type === "thinking") last.thinking += reasoning;
+        const block = this.open?.block as ThinkingOutputBlock | undefined;
+        if (block) block.thinking += reasoning;
         out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open!.index, delta: { type: "thinking_delta", thinking: reasoning } } });
       }
       if (typeof delta.content === "string" && delta.content) {
         if (!this.open || this.open.kind !== "text") {
-          this.content.push({ type: "text", text: "" });
-          out.push(...this.openBlock("text", { type: "text", text: "" }));
+          out.push(...this.openBlock("text", { type: "text", text: "" }, undefined, { type: "text", text: "" }));
         }
-        const last = this.content[this.content.length - 1];
-        if (last?.type === "text") last.text += delta.content;
+        const block = this.open?.block as TextOutputBlock | undefined;
+        if (block) block.text += delta.content;
         out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open!.index, delta: { type: "text_delta", text: delta.content } } });
       }
       if (Array.isArray(delta.tool_calls)) {
@@ -458,6 +626,41 @@ export class OpenAiStreamMapper {
       }
     }
     return out;
+  }
+
+  /**
+   * Seal a closing thinking block of our own: a Chat block into the envelope that names the field to
+   * replay its text under (see `feedChat`).
+   */
+  private signatureForChat(block: OutputBlock | undefined): string | undefined {
+    if (this.wire !== "chat" || block?.type !== "thinking" || block.thinking.length === 0) return undefined;
+    const signature = encodeEnvelope({ w: "chat", p: this.env.p, m: this.env.m, f: this.chatReasoningField });
+    block.signature = signature;
+    this.reasoningCount++;
+    return signature;
+  }
+
+  /**
+   * Put the finished Responses reasoning item into the envelope its block carries: the wire, this
+   * provider and model, and the item itself — type, id, summary and the backend's sealed blob,
+   * untouched (reasoning.ts). An item the backend did not seal has nothing to resume, so its block
+   * stays unsigned and only its summary survives, as display text.
+   */
+  private sealReasoningItem(item: ResponseItem): void {
+    const held = this.reasoningItems.get(item.id);
+    const block = item.block as ThinkingOutputBlock;
+    block.thinking = held?.text.trim() || block.thinking.trim() || (typeof held?.summary === "string" ? held.summary.trim() : "");
+    if (!held?.encrypted) {
+      // An item the backend did not seal has nothing to resume. The block stays unsigned, so the
+      // client treats it as display text and never replays it (reasoning.ts).
+      block.signature = "";
+      return;
+    }
+    const reasoning: ReplayedReasoning = { type: "reasoning", encrypted_content: held.encrypted };
+    if (item.id) reasoning.id = item.id;
+    if (Array.isArray(held.summary)) reasoning.summary = held.summary;
+    block.signature = encodeEnvelope({ w: "responses", p: this.env.p, m: this.env.m, r: reasoning as unknown as Record<string, unknown> });
+    this.reasoningCount++;
   }
 
   private responseItem(id: unknown, kind?: ResponseItem["kind"]): ResponseItem | undefined {
@@ -493,6 +696,21 @@ export class OpenAiStreamMapper {
         item.closed = true;
         continue;
       }
+      if (item.kind === "reasoning") {
+        // Emitted only once the item is done, because the block is handed over whole: the sealed
+        // reasoning is what goes in the envelope, and it may only arrive with the completed item.
+        // `sealReasoningItem` has already put the envelope on the block by then.
+        if (!item.done) break;
+        const reasoning = item.block as ThinkingOutputBlock;
+        out.push(...this.openBlock("thinking", { type: "thinking", thinking: "" }));
+        if (reasoning.signature !== undefined) this.open = { ...this.open!, signature: reasoning.signature };
+        if (reasoning.thinking) out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open!.index, delta: { type: "thinking_delta", thinking: reasoning.thinking } } });
+        item.emitted = true;
+        item.emittedText = reasoning.thinking.length;
+        out.push(...this.closeBlock());
+        item.closed = true;
+        continue;
+      }
       const tool = item.block as ToolOutputBlock;
       out.push(...this.openBlock("tool", { type: "tool_use", id: tool.id, name: tool.name, input: {} }, tool.index));
       if (tool.args) {
@@ -511,7 +729,7 @@ export class OpenAiStreamMapper {
     const out = [...this.start()];
     const type = typeof ev.type === "string" ? ev.type : "";
     if (type === "response.output_item.added") {
-      const item = ev.item as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown } | undefined;
+      const item = ev.item as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
       const id = typeof item?.id === "string" ? item.id : undefined;
       if (id && item?.type === "message") {
         const block: TextOutputBlock = { type: "text", text: "" };
@@ -520,9 +738,24 @@ export class OpenAiStreamMapper {
         this.responseItems.push(responseItem);
         this.responseItemsById.set(id, responseItem);
       } else if (id && item?.type === "function_call") {
+        this.lastCallId = item.call_id === undefined || item.call_id === null ? id : String(item.call_id);
         const index = this.content.filter((block) => block.type === "tool_use").length;
         const tool = this.toolFor(index, { id: item.call_id ?? item.id, function: { name: item.name } });
         const responseItem: ResponseItem = { id, kind: "tool", block: tool, done: false, emitted: false, closed: false, emittedText: 0 };
+        this.responseItems.push(responseItem);
+        this.responseItemsById.set(id, responseItem);
+      } else if (id && item?.type === "reasoning") {
+        // The item's sealed reasoning and summary, held until the item is done: the block handed over
+        // carries both, and a half-assembled one must not reach the client (reasoning.ts).
+        const reasoning: ReasoningItem = {
+          ...(typeof item.encrypted_content === "string" && item.encrypted_content ? { encrypted: item.encrypted_content } : {}),
+          summary: item.summary,
+          text: "",
+        };
+        this.reasoningItems.set(id, reasoning);
+        const block: ThinkingOutputBlock = { type: "thinking", thinking: "" };
+        this.content.push(block);
+        const responseItem: ResponseItem = { id, kind: "reasoning", block, done: false, emitted: false, closed: false, emittedText: 0 };
         this.responseItems.push(responseItem);
         this.responseItemsById.set(id, responseItem);
       }
@@ -548,11 +781,38 @@ export class OpenAiStreamMapper {
           item.emittedText += text.length;
         }
       }
+    } else if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+      // The summary, shown as the thinking block's text. When there is none — which is the usual
+      // shape — nothing arrives and the block stays empty, exactly as the item was measured.
+      const text = typeof ev.delta === "string" ? ev.delta : "";
+      const item = this.responseItem(ev.item_id, "reasoning");
+      if (item?.kind === "reasoning" && text) {
+        const block = item.block as ThinkingOutputBlock;
+        block.thinking += text;
+        if (this.reasoningItems.get(item.id)) this.reasoningItems.get(item.id)!.text += text;
+        if (item.emitted && this.open?.kind === "thinking") {
+          out.push({ event: "content_block_delta", data: { type: "content_block_delta", index: this.open.index, delta: { type: "thinking_delta", thinking: text } } });
+          item.emittedText += text.length;
+        }
+      }
     } else if (type === "response.output_item.done") {
-      const item = this.responseItem(ev.item_id ?? (ev.item as { id?: unknown } | undefined)?.id);
-      if (item) item.done = true;
+      const done = ev.item as { id?: unknown; type?: unknown; encrypted_content?: unknown; summary?: unknown } | undefined;
+      const item = this.responseItem(ev.item_id ?? done?.id);
+      if (done?.encrypted_content !== undefined || done?.summary !== undefined) {
+        // The backend may seal the reasoning only when the item completes; take it from there too.
+        const held = this.reasoningItems.get(typeof (ev.item_id ?? done?.id) === "string" ? String(ev.item_id ?? done?.id) : "");
+        if (held) {
+          if (typeof done.encrypted_content === "string" && done.encrypted_content) held.encrypted = done.encrypted_content;
+          if (done.summary !== undefined) held.summary = done.summary;
+        }
+      }
+      if (item) {
+        item.done = true;
+        if (item.kind === "reasoning") this.sealReasoningItem(item);
+      }
     } else if (type === "response.completed" || type === "response.incomplete") {
-      const response = ev.response as { usage?: unknown; incomplete_details?: { reason?: unknown } } | undefined;
+      const response = ev.response as { service_tier?: unknown; usage?: unknown; incomplete_details?: { reason?: unknown } } | undefined;
+      if (typeof response?.service_tier === "string") this.servedTier = response.service_tier;
       this.setUsage(response?.usage);
       if (response?.incomplete_details?.reason === "max_output_tokens") this.finishReason = "length";
       this.sawCompletion = true;
@@ -566,6 +826,7 @@ export class OpenAiStreamMapper {
 
   feed(ev: Record<string, unknown>, wire: OpenAiWire): AnthropicEvent[] {
     if (this.finished) return [];
+    this.wire = wire;
     // Some OpenAI-compatible servers emit an ordinary `{error:{...}}` JSON SSE payload
     // instead of the Responses `error` event shape. Do not finish it as a successful answer.
     if (ev.error && typeof ev.error === "object") {
@@ -582,13 +843,16 @@ export class OpenAiStreamMapper {
     return [...this.start(), ...this.closeBlock(), { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: this.stopReason, stop_sequence: null }, usage: this.usage } }, { event: "message_stop", data: { type: "message_stop" } }];
   }
 
-  fail(message: string, code?: string): AnthropicEvent[] {
+  fail(rawMessage: string, code?: string): AnthropicEvent[] {
     if (this.finished) return [];
     this.finished = true;
+    // A vendor's error text can echo the credential it was sent; the client, the non-streamed body
+    // and the request log all take `failure.message`, so it is cleaned once, here.
+    const message = this.redactError(rawMessage);
     // `overloaded_error` is the one mid-stream error Claude Code retries on its own (CLI 2.1.278
     // matches `"type":"overloaded_error"` in the message); `api_error` ends the turn for good.
     const type = code === "rate_limit_exceeded" ? "rate_limit_error" : code === "server_is_overloaded" ? "overloaded_error" : "api_error";
-    this.failure = { type, message };
+    this.failure = { type, message, ...(code ? { code } : {}) };
     return [...this.start(), ...this.closeBlock(), { event: "error", data: { type: "error", error: { type, message } } }];
   }
 

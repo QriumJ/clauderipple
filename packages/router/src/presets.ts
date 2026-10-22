@@ -11,7 +11,7 @@
 export type PresetModel = {
   id: string;
   name: string;
-  wire?: "chat" | "responses" | "anthropic";
+  wire?: "chat" | "responses" | "anthropic" | "google";
   url?: string;
   authHeader?: "x-api-key" | "authorization-bearer";
   /** An empty array disables the provider fallback for this model, exactly as on a provider. */
@@ -45,6 +45,17 @@ export type ProviderPreset = {
    * measured reply, never from a docs page: DeepSeek's docs do not mention it and it works.
    */
   serverTools?: boolean;
+  /**
+   * Models the plan runs a web search for on its Anthropic endpoint, although they are spoken to
+   * on another wire. Only ever set from a measured reply, like `serverTools`.
+   */
+  anthropicSearch?: { url: string; authHeader: "x-api-key" | "authorization-bearer"; models: string[] };
+  /**
+   * Ask the Responses wire for its reasoning sealed (`include: ["reasoning.encrypted_content"]`,
+   * `reasoning.summary: "auto"`), so the conversation can carry it back (reasoning.ts). Only ever set
+   * from a measured reply: a vendor that does not know the field may refuse the turn outright.
+   */
+  sealedReasoning?: boolean;
   verified: boolean;
   notes?: string;
   docsUrl: string;
@@ -63,9 +74,12 @@ export const PRESETS: ProviderPreset[] = [
       { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
       { id: "deepseek-flash", name: "DeepSeek Flash" },
     ],
-    // https://api-docs.deepseek.com/guides/anthropic_api/ documents thinking and output_config.effort,
-    // but no accepted effort-level set for its Anthropic endpoint; strip effort rather than guess.
-    effortLevels: [],
+    // https://api-docs.deepseek.com/guides/thinking_mode/ maps every requested effort onto three:
+    // minimal/low → low, medium/high/xhigh → high, max/ultra → max (thinking on, high, by default).
+    // Measured 2026-10-06 on this endpoint: `output_config.effort` is validated (an unknown value is
+    // 422 "expected one of none … max") and low/high/max answer 200 on deepseek-v4-pro and
+    // deepseek-flash. Offering the three real levels keeps the menu from showing steps that collapse.
+    effortLevels: ["low", "high", "max"],
     thinking: "enabled",
     // Measured 2026-09-17, not documented: a `web_search_20250305` tool sent to this endpoint came
     // back with server_tool_use, a web_search_tool_result holding ten hits, and
@@ -222,13 +236,14 @@ export const PRESETS: ProviderPreset[] = [
   },
   // Docs: https://opencode.ai/docs/go/
   //
-  // One subscription, one key, one `/models` catalog, three endpoints by which wire each model
+  // One subscription, one key, one `/models` catalog, four endpoint shapes by which wire each model
   // speaks: `/responses` for Muse Spark, Grok and GPT; `/chat/completions` for GLM, Kimi, DeepSeek,
-  // LongCat and MiMo; `/messages` (Anthropic) for MiniMax and Qwen. This used to be three presets
-  // because a provider carried one url and one wire; now a model carries its own wire, url and auth
-  // header (`ProviderModel`), so the account is one preset and `providerFor` folds the override in
-  // when the model is known. The provider-level values below are the Responses base — which is where
-  // Muse Spark lives, and the wire a model with no override gets.
+  // LongCat and MiMo; `/messages` (Anthropic) for MiniMax and Qwen; and Gemini 4 Argon on Google's
+  // `generateContent` under `/inference/go/google`. This used to be three presets because a provider
+  // carried one url and one wire; now a model carries its own wire, url and auth header
+  // (`ProviderModel`), so the account is one preset and `providerFor` folds the override in when the
+  // model is known. The provider-level values below are the Responses base — which is where Muse
+  // Spark lives, and the wire a model with no override gets.
   //
   // `x-opencode-session` is not optional at all: the vendor answers 400 `MissingSessionID` without
   // it — "cannot be routed efficiently" — so it gates the request rather than just the cache.
@@ -245,6 +260,9 @@ export const PRESETS: ProviderPreset[] = [
     authHeader: "authorization-bearer",
     wire: "responses",
     sessionHeader: "x-opencode-session",
+    // Measured 2026-10-14 on muse-spark-1.3-contributor: `include` and `summary` are accepted, the
+    // sealed item comes back on a tool-bearing turn, and replaying it in place answers 200.
+    sealedReasoning: true,
     modelsUrl: "https://opencode.ai/zen/go/v1/models",
     modelsAuthHeader: "authorization-bearer",
     // Every wire below is from the endpoint table OpenCode publishes per model
@@ -298,6 +316,12 @@ export const PRESETS: ProviderPreset[] = [
       { id: "qwen3.7-max", name: "Qwen3.7 Max", wire: "anthropic", url: "https://opencode.ai/zen/go", authHeader: "x-api-key" },
       { id: "qwen3.7-plus", name: "Qwen3.7 Plus", wire: "anthropic", url: "https://opencode.ai/zen/go", authHeader: "x-api-key" },
       { id: "qwen3.6-plus", name: "Qwen3.6 Plus", wire: "anthropic", url: "https://opencode.ai/zen/go", authHeader: "x-api-key" },
+      // Gemini, on Google's own generateContent wire rather than either OpenAI one. Its endpoint is
+      // a different origin path and takes the key on `x-goog-api-key`; the docs give the model's
+      // full URL as https://opencode.ai/inference/go/google/v1beta/models/<id> (read 2026-10-21).
+      // `providerFor` folds it into an ordinary google provider, and the transport appends
+      // `/v1beta/models/<id>:generateContent` to this base (providers/google/transport.ts).
+      { id: "gemini-4-argon-contributor", name: "Gemini 4 Argon (Contributor)", wire: "google", url: "https://opencode.ai/inference/go/google" },
     ],
     // Measured 2026-09-18 against the live endpoint, one effort at a time: none, minimal, low,
     // medium, high and xhigh are accepted; **max and ultra are refused** with invalid_request_error.
@@ -306,6 +330,14 @@ export const PRESETS: ProviderPreset[] = [
     // to the Responses models above; the Chat and Anthropic ones carry their own empty ladder.
     effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh"],
     thinking: "none",
+    // No model on this plan searches. The DeepSeek models are served on Chat Completions, which
+    // ignores every search option, and DeepSeek's search has only ever worked on DeepSeek's own API.
+    // A 2026-10-07 note here claimed the plan's Anthropic endpoint ran `web_search_20250305` for
+    // them; it was wrong — the user reports it never searched, and on 2026-10-21 the relay answered
+    // HTTP 200 with no `web_search_tool_result` hits ("opencode-go web search: no results
+    // returned"). The list stays empty so `/api/status` offers none of them as searchable and a
+    // search routed there is refused instead of fabricated.
+    anthropicSearch: { url: "https://opencode.ai/zen/go", authHeader: "x-api-key", models: [] },
     verified: true,
     notes: "One subscription and key, three endpoints by wire. Measured 2026-09-18. Responses: Muse Spark answers, effort ladder tops out at xhigh, prompt cache reached 96% on a repeated turn. Chat: glm-5.3, glm-5.3-flash, kimi-k3, kimi-k2.7-code, deepseek-v4.1-flash, deepseek-v4-pro, longcat-2.0 and mimo-v2.5-pro all answered. Anthropic: minimax-m3, qwen3.8-max and qwen3.8-flash answered with the prompt cache at 99% on a repeated turn, while union-alpha, the free row, answered \"Model is unavailable\". The Muse Spark Contributor tier is ~90% cheaper because Meta states those interactions improve its products, and OpenCode refuses the model until the workspace opts in (403 DataPolicyError); it is also limited to some regions.",
     docsUrl: "https://opencode.ai/docs/go/",

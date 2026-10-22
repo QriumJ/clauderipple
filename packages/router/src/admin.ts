@@ -14,28 +14,47 @@
 //   PATCH/DELETE /api/google-accounts/:id rename, pause/resume, clear a cooldown; remove
 //   GET  /api/update    whether a newer version is published, and how this copy was installed
 //   POST /api/update    start `clauderipple update` in the background (it restarts this router)
+//   GET  /api/power     lid-closed awake + hotspot failover state (power.ts)
+//   PUT  /api/power     change awake mode/until, tether on/off (saved), pin (in memory)
+//   POST /api/power/setup  start `clauderipple awake setup [--ssid]` (macOS password dialog); GET polls it
 //   GET  /*           static files from packages/ui (the GUI itself)
 
 import crypto from "node:crypto";
+import { phoneRequest } from "./phone.ts";
+import type { PhoneDeps } from "./phone.ts";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { execFile, spawn } from "node:child_process";
+import { runCli, startCliDetached, parseUpdateCheck, type DetachedCli } from "./cli-control.ts";
+import { AutoUpdater } from "./autoupdate.ts";
+export { parseUpdateCheck, type UpdateCheck } from "./cli-control.ts";
 import { fileURLToPath } from "node:url";
 import type { Config, Provider, ProviderModel } from "./config.ts";
-import { homeDir, validate } from "./config.ts";
+import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem, validate } from "./config.ts";
+export { adminPort } from "./config.ts";
+import { generatedAgents } from "./agents.ts";
+import { isJudgeOnlyModel } from "./model-policy.ts";
+import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeModSettings } from "./mod-settings.ts";
+import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod/hooks/ladder.ts";
+import { normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
+import type { Billing, DomainRules, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
+import { chatPickerModels } from "./picker.ts";
 import type { Logger } from "./log.ts";
+import type { ProviderExhaustion } from "./health.ts";
 import type { Stats } from "./proxy.ts";
 import type { RequestLog } from "./requestlog.ts";
 import { PRESETS, type ProviderPreset } from "./presets.ts";
 import { resolveCompatibleCaps } from "./compat.ts";
+import { redactErrorText } from "./redact.ts";
 import { CHATGPT_FALLBACK_MODELS } from "./providers/chatgpt/catalog.ts";
 import { measureModel, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
 import { catalogEntry } from "./catalog.ts";
-import { ClaudeCodeAuthStore, nativeAnthropicHeaders } from "./providers/anthropic.ts";
+import { ModelScoreCatalog, buildModelScores } from "./model-scores.ts";
+import { ClaudeCodeAuthStore, nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
+import { fetchClaudeModels, newClaudeReleases, type ClaudeModel } from "./providers/anthropic-models.ts";
 import { codexEnabled, codexHome } from "../../cli/src/codex.ts";
 import { openBrowser } from "../../cli/src/browser.ts";
 import { caTrusted, currentAppProxy } from "../../cli/src/picker.ts";
@@ -44,13 +63,21 @@ import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
-import { listClaudeAccounts, removeClaudeAccount, renameClaudeAccount } from "./providers/anthropic-accounts.ts";
+import { listClaudeAccounts, removeClaudeAccount, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
 import { readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
-import { IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
+import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
+import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
+import { isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
+import type { GrokWindow } from "./providers/grok/usage.ts";
 import { ANTIGRAVITY_WARNING, staticAntigravityModels } from "./providers/google/antigravity.ts";
 import { readGoogleAccounts, removeGoogleAccount, summarize as summarizeGoogleAccount, updateGoogleAccount } from "./providers/google/accounts.ts";
 import { GoogleOAuthSession, type GoogleOAuthState } from "./providers/google/login.ts";
+import { GROK_AUTH_HINT, grokAuthPath, grokHome, readGrokToken, sharedGrokAuth } from "./providers/grok/auth.ts";
+import { GROK_DEFAULT_URL, GROK_EFFORT_LEVELS, GROK_FALLBACK_MODELS, grokModelsFromListing } from "./providers/grok/catalog.ts";
+import { GROK_WARNING, grokHeaders } from "./providers/grok/index.ts";
+import type { TunnelStatus } from "./remote-tunnel.ts";
+import { parsePowerChange, persistPowerChange, type PowerApi } from "./power.ts";
 
 const MAX_BODY = 1024 * 1024;
 /** `/api/image` carries reference images inline, so it gets more room than a config save. */
@@ -72,11 +99,14 @@ const MIME: Record<string, string> = {
 };
 
 export type AdminDeps = {
+  /** External boundaries for the host-local control bridge; no production side effects in tests. */
+  phone?: PhoneDeps;
   config: () => Config;
   configFile: string;
   log: Logger;
   stats: () => Stats;
   health: () => number;
+  providerHealth?: () => Record<string, ProviderExhaustion>;
   version: string;
   requests: RequestLog;
   /** Optional: chatgpt providers' latest rate-limit snapshot and credential status. */
@@ -102,6 +132,8 @@ export type AdminDeps = {
     accounts: () => Record<string, GoogleAccountStatus[]>;
     /** The models one antigravity provider can reach, from Cloud Code Assist's own catalogue. */
     models?: (name: string) => Promise<ProviderModel[] | null>;
+    /** Each antigravity account's quota groups by owner id, for the status bar's limits row (`/api/limits`). Absent in tests. */
+    usage?: (name: string) => Promise<Record<string, QuotaGroup[]>>;
     /** Put one resting account back into rotation now. */
     clearCooldown?: (accountId: string) => void;
     /** Ask Google again whether an account still needs its verification page. */
@@ -120,10 +152,13 @@ export type AdminDeps = {
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Test seam for Claude Code's keychain and credential-file readers. */
+  claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   /** Test seam for the local CLI side effects. Production uses the installed CLI runtime. */
   runCli?: (args: string[], timeout?: number) => Promise<{ ok: boolean; output: string }>;
   /** Test seam for a CLI run that must outlive this router (the update). */
-  startCliDetached?: (args: string[], log: string) => void;
+  startCliDetached?: (args: string[], log: string, env?: NodeJS.ProcessEnv) => DetachedCli | void;
+  autoUpdater?: AutoUpdater;
   /** Test seam for the native Anthropic API-key probe. */
   probeFetch?: (url: string, init: RequestInit) => Promise<Response>;
   /** Test seam for a provider model probe (`POST /api/providers/probe`), which in production uses a timeout. */
@@ -133,18 +168,35 @@ export type AdminDeps = {
   /** The public model catalogue (models.dev) a measurement reads before asking. Supplied by the
    * router; absent in tests, which then measure everything by request as before. */
   modelCatalog?: () => Promise<unknown>;
+  /** Agent directory boundary; defaults to ~/.claude/agents, isolated in admin tests. */
+  agentDir?: string;
+  /** External AA dataset fetch boundary; the same cache/TTL is used in tests and production. */
+  modelScoresFetch?: typeof fetch;
   /** Test seams for the Claude subscription sign-in: the token endpoint and the browser. */
   claudeOAuthFetch?: (url: string, init: RequestInit) => Promise<Response>;
   openBrowser?: (url: string) => boolean;
   /** Begin a graceful drain and exit. Supplied by the router; absent in tests. */
   shutdown?: () => void;
   /** One image through the ChatGPT subscription (`POST /api/image`). */
-  image?: (req: ImageRequest, signal: AbortSignal) => Promise<ImageResult>;
+  image?: (req: ImageRequest, signal: AbortSignal, meta?: { session?: string }) => Promise<ImageResult>;
   /**
    * Usage of each Claude subscription account, keyed by owner id ("current" for the Claude Code
    * login, otherwise the account id `/api/claude-accounts` lists). Absent in tests.
    */
   claudeUsage?: () => Promise<Record<string, Record<string, unknown>>>;
+  /** The Claude models the signed-in account can use (`GET /v1/models`); null until one answer. Absent in tests. */
+  claudeModels?: () => Promise<ClaudeModel[] | null>;
+  /** An OpenCode Go provider's usage windows, for the status bar's limits row (`/api/limits`). Absent in tests. */
+  opencodeUsage?: (name: string) => Promise<OpenCodeWindow[]>;
+  /** A Grok provider's usage pool, for the status bar's limits row (`/api/limits`). Absent in tests. */
+  grokUsage?: (name: string) => Promise<GrokWindow[]>;
+  /**
+   * Reverse SSH tunnels to remote hosts (remote-tunnel.ts): `GET /api/remote` reports them,
+   * `POST /api/remote/reload` re-reads `remote.hosts` from the config (after `remote add|remove`).
+   */
+  remote?: { status: () => TunnelStatus[]; reload: () => TunnelStatus[] };
+  /** Lid-closed awake and hotspot failover (`GET|PUT /api/power`). Absent: 501. */
+  power?: PowerApi;
 };
 
 /** Claude usage is looked up only where a Claude subscription provider is configured. */
@@ -172,6 +224,142 @@ async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label:
   return rows;
 }
 
+// ---- Limits (`GET /api/limits`) ----------------------------------------------------------------
+//
+// One shape for every provider whose quota can be read, so the status bar's second row instrument
+// them all the same way: Claude's plan windows and per-model weeklies, each ChatGPT account's
+// windows, each Antigravity account's Gemini and third-party windows, OpenCode Go's three windows
+// and a Grok subscription's usage pool. Providers with no way to read a quota (OpenCode Zen, the
+// compatible APIs) are simply not listed, and a provider
+// saved with `limits: false` opts out. Read in the provider's config order; the mod keeps Claude
+// first and otherwise follows this order.
+
+/** One window the limits row reads. `reset_at` is epoch seconds, as the other readers use. */
+export type LimitsWindow = { kind: "five_hour" | "seven_day" | "scoped" | "window"; label?: string; used_percent: number; window_minutes?: number; reset_at?: number };
+export type LimitsAccount = { account: number; windows: LimitsWindow[]; at: number };
+export type LimitsProvider = { provider: string; type: string; title: string; accounts: LimitsAccount[] };
+
+/** A `{used_percent, window_minutes, reset_at}` snapshot window as `/api/limits` reads it, or null. */
+function limitWindowFrom(w: unknown): { used_percent: number; window_minutes?: number; reset_at?: number } | null {
+  if (!w || typeof w !== "object" || Array.isArray(w)) return null;
+  const o = w as Record<string, unknown>;
+  const used = o.used_percent;
+  if (typeof used !== "number" || !Number.isFinite(used)) return null;
+  const minutes = typeof o.window_minutes === "number" && o.window_minutes > 0 ? o.window_minutes : undefined;
+  // A reset already in milliseconds would otherwise park a window for decades; the other readers
+  // normalise the same way (chatgpt windowResetMs).
+  const reset = typeof o.reset_at === "number" && Number.isFinite(o.reset_at) ? Math.round(o.reset_at > 1e12 ? o.reset_at / 1000 : o.reset_at) : undefined;
+  return { used_percent: used, ...(minutes !== undefined ? { window_minutes: minutes } : {}), ...(reset !== undefined ? { reset_at: reset } : {}) };
+}
+
+/** The kind a five-hour/weekly/other window takes, by its length in minutes. */
+function windowKind(minutes: number | undefined): "five_hour" | "seven_day" | "window" {
+  return minutes === 300 ? "five_hour" : minutes === 10080 ? "seven_day" : "window";
+}
+
+/** One Claude subscription account's plan windows: the two main windows and the scoped weeklies. */
+function claudeLimitWindows(quota: Record<string, unknown>): LimitsWindow[] {
+  const out: LimitsWindow[] = [];
+  const limits = quota.rate_limits as { primary?: unknown; secondary?: unknown } | undefined;
+  for (const w of [limits?.primary, limits?.secondary]) {
+    const win = limitWindowFrom(w);
+    if (win) out.push({ kind: windowKind(win.window_minutes), used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
+  }
+  const scoped = quota.scoped;
+  if (Array.isArray(scoped)) for (const s of scoped) {
+    if (!s || typeof s !== "object" || Array.isArray(s)) continue;
+    const entry = s as { name?: unknown; used_percent?: unknown; window_minutes?: unknown; reset_at?: unknown };
+    const win = limitWindowFrom(entry);
+    if (!win || typeof entry.name !== "string" || !entry.name) continue;
+    out.push({ kind: "scoped", label: entry.name, used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
+  }
+  return out;
+}
+
+/** The Claude Code login's plan windows as one account (the row shows Claude as a single group). */
+async function anthropicLimitAccounts(deps: AdminDeps): Promise<LimitsAccount[]> {
+  let usage: Record<string, Record<string, unknown>>;
+  try {
+    usage = (await deps.claudeUsage?.()) ?? {};
+  } catch {
+    return [];
+  }
+  const quota = usage.current ?? Object.values(usage)[0];
+  if (!quota) return [];
+  const windows = claudeLimitWindows(quota);
+  if (!windows.length) return [];
+  const at = typeof quota.at === "number" ? quota.at : Date.now();
+  return [{ account: 0, windows, at }];
+}
+
+/** Every ChatGPT account's windows, paused and needs-login accounts left out and unnumbered. */
+function chatgptLimitAccounts(accounts: ChatGptAccountStatus[]): LimitsAccount[] {
+  const kept = accounts.filter((a) => a.state !== "paused" && a.state !== "needs-login");
+  const out: LimitsAccount[] = [];
+  kept.forEach((account, index) => {
+    const quota = account.quota;
+    if (!quota || typeof quota.at !== "number") return;
+    const limits = quota.rate_limits as { primary?: unknown; secondary?: unknown } | undefined;
+    const windows: LimitsWindow[] = [];
+    for (const w of [limits?.primary, limits?.secondary]) {
+      const win = limitWindowFrom(w);
+      if (win) windows.push({ kind: windowKind(win.window_minutes), used_percent: win.used_percent, ...(win.window_minutes !== undefined ? { window_minutes: win.window_minutes } : {}), ...(win.reset_at !== undefined ? { reset_at: win.reset_at } : {}) });
+    }
+    if (windows.length) out.push({ account: index, windows, at: quota.at });
+  });
+  return out;
+}
+
+/** Every Antigravity account's windows (Gemini's own plus the third-party ones), paused left out. */
+async function googleLimitAccounts(deps: AdminDeps, name: string): Promise<LimitsAccount[]> {
+  const google = deps.google?.();
+  if (!google) return [];
+  const statuses = google.accounts()[name] ?? [];
+  const groups = (await google.usage?.(name)) ?? {};
+  const kept = statuses.filter((a) => a.state !== "paused" && a.state !== "needs-login");
+  const at = Date.now();
+  // The third-party (Claude and GPT) windows only when this provider has such a model selected:
+  // beside Gemini's own they made four figures, two of them a pool nobody here spends (2026-10-20).
+  const provider = deps.config().providers[name];
+  const models = provider && "models" in provider && Array.isArray(provider.models) ? provider.models : [];
+  const thirdParty = models.some((m) => /^(claude-|gpt-oss(-|$))/i.test(typeof m === "string" ? m : m.id));
+  const out: LimitsAccount[] = [];
+  kept.forEach((account, index) => {
+    const quotient = groups[account.id];
+    if (!quotient || !quotient.length) return;
+    const windows: LimitsWindow[] = googleWindowsFromGroups(quotient).filter((w) => thirdParty || w.kind !== "scoped");
+    if (windows.length) out.push({ account: index, windows, at });
+  });
+  return out;
+}
+
+/** Every provider whose quota can be read, in one shape, for `GET /api/limits`. */
+async function buildLimits(deps: AdminDeps): Promise<{ providers: LimitsProvider[] }> {
+  const providers: LimitsProvider[] = [];
+  const chatgpt = deps.chatgpt?.();
+  const accounts = chatgpt?.accounts?.() ?? {};
+  for (const [name, p] of Object.entries(deps.config().providers)) {
+    if (p.limits === false) continue;
+    if (p.type === "anthropic" && p.auth === "claude-code") {
+      const rows = await anthropicLimitAccounts(deps);
+      if (rows.length) providers.push({ provider: name, type: "anthropic", title: "Claude", accounts: rows });
+    } else if (p.type === "chatgpt") {
+      const rows = chatgptLimitAccounts(accounts[name] ?? []);
+      if (rows.length) providers.push({ provider: name, type: "chatgpt", title: "GPT", accounts: rows });
+    } else if (p.type === "google" && p.auth === "antigravity") {
+      const rows = await googleLimitAccounts(deps, name);
+      if (rows.length) providers.push({ provider: name, type: "google", title: "Gemini", accounts: rows });
+    } else if (p.type === "openai-compatible" && isOpenCodeGo(p)) {
+      const windows = (await deps.opencodeUsage?.(name)) ?? [];
+      if (windows.length) providers.push({ provider: name, type: "opencode-go", title: "Go", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
+    } else if (p.type === "grok") {
+      const windows = (await deps.grokUsage?.(name)) ?? [];
+      if (windows.length) providers.push({ provider: name, type: "grok", title: "Grok", accounts: [{ account: 0, windows: windows.map((w) => ({ ...w })), at: Date.now() }] });
+    }
+  }
+  return { providers };
+}
+
 /** One discovered/offered model. Exactly the config shape, so a preset's per-model override
  * (wire/url/authHeader) can be carried straight into a provider entry. */
 type ModelEntry = ProviderModel;
@@ -196,9 +384,12 @@ type ProbeRequest = {
    * omits it reports a broken provider that is in fact fine.
    */
   sessionHeader?: string;
+  /** The OpenAI wire the provider is saved with. Only a hand-entered provider is tested on it; see `probeProvider`. */
+  wire?: "chat" | "responses";
 };
 
-const ANTHROPIC_EFFORT_LEVELS = ["low", "medium", "high", "max"];
+// The CLI's `--effort` takes the same five; Opus, Sonnet and Haiku 5.5 answered `xhigh` (requests.jsonl, 2026-10-14, #56).
+const ANTHROPIC_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const CHATGPT_DEFAULT_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
 type ChatgptLogin = { running: boolean; startedAt?: string; finishedAt?: string; ok?: boolean; output?: string };
@@ -207,23 +398,6 @@ let chatgptLogin: ChatgptLogin = { running: false };
 let claudeOAuth: ClaudeOAuthSession | null = null;
 /** The Google (Antigravity) sign-in in progress (or the last one), for GET /api/google-login. */
 let googleOAuth: GoogleOAuthSession | null = null;
-/** When the GUI last started an update. It restarts this router, so a fresh process starts at 0. */
-let updateStartedAt = 0;
-const UPDATE_RUN_MS = 10 * 60 * 1000;
-
-export type UpdateCheck = { current: string; latest: string | null; newer: boolean; kind: string };
-
-/** The last line of `clauderipple update --check --json`, or null when it said something else. */
-export function parseUpdateCheck(output: string): UpdateCheck | null {
-  try {
-    const check = JSON.parse(output.trim().split("\n").pop() ?? "") as Partial<UpdateCheck>;
-    if (typeof check.current !== "string" || typeof check.newer !== "boolean" || typeof check.kind !== "string") return null;
-    return { current: check.current, latest: typeof check.latest === "string" ? check.latest : null, newer: check.newer, kind: check.kind };
-  } catch {
-    return null;
-  }
-}
-
 /** Shared catalog for the GUI: model-specific values override provider defaults. */
 export function effortLevels(cfg: Config): { providers: Record<string, { default: string[]; models?: Record<string, string[]> }> } {
   const providers: Record<string, { default: string[]; models?: Record<string, string[]> }> = {
@@ -265,6 +439,12 @@ export function effortLevels(cfg: Config): { providers: Record<string, { default
       providers[name] = { default: ANTHROPIC_EFFORT_LEVELS };
       continue;
     }
+    if (provider.type === "grok") {
+      // The proxy's listing gives each model its ladder (the probe saves it); a model it has not
+      // described gets the common one, which is also what the adapter sends it.
+      providers[name] = { default: [...GROK_EFFORT_LEVELS], ...(Object.keys(modelLevels).length ? { models: modelLevels } : {}) };
+      continue;
+    }
     const preset = provider.preset ? PRESETS.find((entry) => entry.id === provider.preset) : undefined;
     providers[name] = {
       default: resolveCompatibleCaps(preset ? { effortLevels: preset.effortLevels, thinking: preset.thinking, ...(preset.serverTools ? { serverTools: true } : {}) } : undefined, provider.caps).effortLevels,
@@ -287,23 +467,29 @@ export function effortLevelsForModel(cfg: Config, modelId: string): string[] | u
   return undefined;
 }
 
+// Only for when Anthropic's own list cannot be had (no sign-in yet, offline): the live list is
+// `deps.claudeModels`, and a release after this table is cut appears there by itself (2026-10-08).
 const CLAUDE_MODEL_FALLBACK: { id: string; name: string }[] = [
-  { id: "claude-fable-5-1", name: "Fable 5.1" },
+  { id: "claude-haiku-5-5", name: "Haiku 5.5" },
+  { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
   { id: "claude-opus-5-5", name: "Opus 5.5" },
+  { id: "claude-fable-5-1", name: "Fable 5.1" },
   { id: "claude-opus-5", name: "Opus 5" },
   { id: "claude-sonnet-5", name: "Sonnet 5" },
-  { id: "claude-haiku-4-5", name: "Haiku 4.5" },
   { id: "claude-fable-5", name: "Fable 5" },
   { id: "claude-opus-4-8", name: "Opus 4.8" },
   { id: "claude-opus-4-7", name: "Opus 4.7" },
-  { id: "claude-opus-4-6", name: "Opus 4.6" },
   { id: "claude-sonnet-4-6", name: "Sonnet 4.6" },
+  { id: "claude-opus-4-6", name: "Opus 4.6" },
+  { id: "claude-haiku-4-5", name: "Haiku 4.5" },
 ];
 
-
-export function adminPort(cfg: Config): number {
-  return cfg.admin?.port ?? cfg.listen.port + 1;
+/** The account's Claude models, or the table above when Anthropic's list cannot be had. */
+async function claudeModelList(deps: AdminDeps): Promise<(ModelEntry & { name: string })[]> {
+  const live = await deps.claudeModels?.().catch(() => null);
+  return live?.length ? live.map(({ line: _line, createdAt: _createdAt, ...model }) => ({ ...model, name: model.name ?? model.id })) : CLAUDE_MODEL_FALLBACK;
 }
+
 
 function settingsPath(): string {
   return process.env.CLAUDE_SETTINGS_PATH ?? path.join(os.homedir(), ".claude", "settings.json");
@@ -321,16 +507,6 @@ function readSettingsEnv(): { HTTPS_PROXY?: string; NODE_EXTRA_CA_CERTS?: string
     return out;
   } catch {
     return {};
-  }
-}
-
-/** Whether ClaudeRipple's agent-title hook is registered in settings.json (see packages/cli/src/settings.ts). */
-function agentTitleHookEnabled(): boolean {
-  try {
-    const s = JSON.parse(fs.readFileSync(settingsPath(), "utf8")) as { hooks?: { PreToolUse?: Record<string, unknown>[] } };
-    return (s.hooks?.PreToolUse ?? []).some((e) => e._clauderipple === "agent-title");
-  } catch {
-    return false;
   }
 }
 
@@ -391,6 +567,15 @@ export function chatgptSignedIn(mode: string | undefined): boolean {
 }
 
 /**
+ * Whether the Grok CLI's session is there and not yet expired. A session near its end still counts:
+ * the router asks the CLI to refresh it before the next turn.
+ */
+export function grokSignedIn(p: { home?: string }): boolean {
+  const token = readGrokToken(grokAuthPath(p.home ?? grokHome()));
+  return token !== null && (token.expiresAt === 0 || token.expiresAt > Date.now());
+}
+
+/**
  * An Antigravity provider is only as usable as its accounts: none signed in, or every one waiting on
  * Google's verification page, answers nothing however reachable the host is.
  */
@@ -400,14 +585,142 @@ export function googleHealth(accounts: GoogleAccountStatus[]): { needsLogin: boo
   return inRotation.length > 0 && inRotation.every((a) => a.state === "needs-verification") ? { needsLogin: false, needsVerification: true } : { needsLogin: false };
 }
 
+type ChatgptStatus = {
+  quota: Record<string, Record<string, unknown> | null>;
+  auth: Record<string, string>;
+  signedIn: Record<string, boolean>;
+  accounts: Record<string, ChatGptAccountStatus[]>;
+  stale?: true;
+  staleReason?: Record<string, string>;
+};
+
+/** Shared by status and mod options: refresh old quota, then read per-account rotation state. */
+async function chatgptStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): Promise<ChatgptStatus> {
+  const chatgpt = deps.chatgpt?.() ?? { quota: {}, auth: {} };
+  const staleReasons: Record<string, string> = {};
+  const now = Date.now();
+  for (const [name, q] of Object.entries(chatgpt.quota)) {
+    if (!chatgpt.refresh) break;
+    const at = q && typeof q.at === "number" ? q.at : 0;
+    if (!opts.refresh && at && now - at < 10 * 60 * 1000) continue;
+    const fresh = await chatgpt.refresh(name);
+    if (fresh) chatgpt.quota[name] = fresh;
+    else staleReasons[name] = opts.refresh ? "refresh requested but lookup failed" : "lookup failed; showing last known value";
+  }
+  const signedIn: Record<string, boolean> = {};
+  for (const [name, p] of Object.entries(deps.config().providers)) {
+    if (p.type === "chatgpt") signedIn[name] = chatgptSignedIn(p.auth);
+  }
+  return {
+    quota: chatgpt.quota, auth: chatgpt.auth, signedIn, accounts: chatgpt.accounts?.() ?? {},
+    ...(Object.keys(staleReasons).length ? { stale: true, staleReason: staleReasons } : {}),
+  };
+}
+
+export type ModOptions = {
+  /** Each worker with its model's effort ladder (mod efforts only) and how it is paid for. */
+  agents: (ReturnType<typeof generatedAgents>[number] & { efforts: Effort[]; billing: Billing })[];
+  models: { model: string; provider: string; name: string; judgeOnly: boolean }[];
+  providers: { name: string; type: Provider["type"]; usable: boolean; billing: Billing; reason?: string; exhaustedAt?: number; exhaustedUntil?: number }[];
+  zen: { configured: boolean; model: string | null };
+  scores: ReturnType<typeof buildModelScores>;
+  /** Claude's own models' effort ladder, for the rungs that run Claude Code's own agent. */
+  claudeEfforts: Effort[];
+};
+
+const MOD_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+const modEfforts = (levels: readonly string[] | undefined): Effort[] => (levels ?? []).filter((level): level is Effort => MOD_EFFORTS.includes(level));
+
+async function modOptions(deps: AdminDeps, scores: ModelScoreCatalog): Promise<ModOptions> {
+  const cfg = deps.config();
+  const chatgpt = await chatgptStatus(deps);
+  const google = deps.google?.().accounts() ?? {};
+  const credentials = deps.credentials?.() ?? {};
+  const health = deps.providerHealth?.() ?? {};
+  const providers = Object.entries(cfg.providers).map(([name, p]) => {
+    let usable = true;
+    if (p.type === "chatgpt") {
+      const accounts = chatgpt.accounts[name];
+      usable = accounts ? accounts.some(a => a.state === "ready" && !exhaustedForMs(a.quota))
+        : chatgpt.signedIn[name] === true && !exhaustedForMs(chatgpt.quota[name]);
+    } else if (p.type === "google") {
+      usable = p.auth === "antigravity" ? (google[name] ?? []).some(a => a.state === "ready")
+        : !!(p.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+    } else if (p.type === "anthropic") {
+      usable = p.auth === "api-key" ? !!(p.apiKey || process.env.ANTHROPIC_API_KEY) : claudeAuthStore(deps).describeSource() !== null;
+    }
+    if (credentials[name]) usable = usable && credentials[name]!.some(c => c.state === "ready");
+    const exhausted = health[name];
+    return { name, type: p.type, usable: usable && !exhausted, billing: billingOf(p as { type: string; auth?: string; preset?: string; url?: string }),
+      ...(exhausted ? { reason: exhausted.reason, exhaustedAt: exhausted.at, exhaustedUntil: exhausted.until } : {}),
+    };
+  });
+  const models = Object.entries(cfg.providers).flatMap(([provider, p]) => (p.models ?? []).map(m => ({ model: m.id, provider, name: m.name ?? m.id, judgeOnly: isJudgeOnlyModel(m.id) })));
+  const zen = Object.values(cfg.providers).find(p => {
+    if (!p.models?.some(m => isJudgeOnlyModel(m.id))) return false;
+    if ("preset" in p && p.preset === "opencode-zen") return true;
+    if (!("url" in p) || !p.url) return false;
+    const url = new URL(p.url);
+    return url.hostname === "opencode.ai" && /^\/zen\/v1(?:\/|$)/.test(url.pathname);
+  });
+  const model = zen?.models?.find(m => isJudgeOnlyModel(m.id))?.id ?? null;
+  const catalog = effortLevels(cfg).providers;
+  const agents = generatedAgents(cfg, deps.agentDir, undefined, deps.log).map(a => ({
+    ...a,
+    efforts: modEfforts(catalog[a.provider]?.models?.[a.model] ?? catalog[a.provider]?.default),
+    billing: billingOf(cfg.providers[a.provider] as { type: string; auth?: string; preset?: string; url?: string }, a.model),
+  }));
+  const scored = buildModelScores(cfg, await scores.get());
+  const claudeEfforts = modEfforts(catalog.anthropic?.default);
+  return { agents, models, providers, zen: { configured: model !== null, model }, scores: scored, claudeEfforts };
+}
+
+/**
+ * What the four workers can be filled from: the generated workers whose provider can run now, with
+ * their ladders, billing and cheapest measured cost, then Claude's own models (always there).
+ */
+function ladderChoices(options: ModOptions): LadderChoice[] {
+  const usable = new Set(options.providers.filter(p => p.usable).map(p => p.name));
+  return [
+    ...options.agents.filter(a => usable.has(a.provider)).map(a => {
+      const costs = (options.scores.models.find(m => m.model === a.model && m.provider === a.provider)?.variants ?? []).flatMap(v => typeof v.costPerTask === "number" ? [v.costPerTask] : []);
+      return { target: { agent: a.name }, model: a.model, provider: a.provider, billing: a.billing, efforts: a.efforts, ...(costs.length ? { cost: Math.min(...costs) } : {}) };
+    }),
+    ...claudeChoices(options.claudeEfforts),
+  ];
+}
+
+/**
+ * Fill empty ordered lists in Base and saved modes from the same ticked, connected choices.
+ * Existing lists survive availability and allow-list changes; dispatch handles skips.
+ */
+async function withFilledLadder(deps: AdminDeps, scores: ModelScoreCatalog, settings: Settings): Promise<Settings> {
+  const general = settings.rules.general;
+  const sets = [settings, ...settings.modes];
+  const domains = sets.flatMap(set => Object.values(set.domainRules ?? {}));
+  if (![general, ...settings.modes, ...domains].some(set => ladderNeedsFill(set.rungs))) return settings;
+  try {
+    const choices = ladderChoices(await modOptions(deps, scores));
+    const fill = (rungs: Settings['rules']['general']['rungs']) => fillLadder(rungs, settings.allow, choices, settings.allowKnown).rungs;
+    // A domain ladder has two levels: the fold keeps each pair equal, before and after the fill.
+    const fillDomains = (rules: DomainRules): DomainRules => Object.fromEntries(Object.entries(rules).map(([key, rule]) => [key, { mode: "ladder", rungs: twoLevelRungs(fill(twoLevelRungs(rule.rungs))) }]));
+    const modes = settings.modes.map(mode => ({ ...mode, rungs: fill(mode.rungs), ...(mode.domainRules ? { domainRules: fillDomains(mode.domainRules) } : {}) }));
+    return { ...settings, rules: { general: { mode: "ladder", rungs: fill(general.rungs) } }, ...(settings.domainRules ? { domainRules: fillDomains(settings.domainRules) } : {}), modes };
+  } catch (error) {
+    deps.log.warn(`admin: filling the worker ladder failed: ${(error as Error).message}`);
+    return settings;
+  }
+}
+
 async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): Promise<Record<string, unknown>> {
   const cfg = deps.config();
+  const health = deps.providerHealth?.() ?? {};
   const providers: Record<string, { url: string; type: string; reachable: boolean; authSource?: "observed" | "env" | "keychain" | "credentials-file" | "token-file" | null; signedIn?: "oauth" | "setup-token" | null; accountCount?: number }> = {};
   // Keyed in the order the config lists them. Assigning inside the Promise.all callbacks ordered
   // them by whichever TCP check answered first, so the Health list reshuffled on every poll.
   const checked = await Promise.all(
     Object.entries(cfg.providers).map(async ([name, p]) => {
-      const url = p.type === "anthropic" ? "https://api.anthropic.com" : p.type === "chatgpt" ? (p.url ?? "https://chatgpt.com/backend-api") : p.type === "google" ? (p.url ?? "https://generativelanguage.googleapis.com") : p.url;
+      const url = p.type === "anthropic" ? "https://api.anthropic.com" : p.type === "chatgpt" ? (p.url ?? "https://chatgpt.com/backend-api") : p.type === "google" ? (p.url ?? "https://generativelanguage.googleapis.com") : p.type === "grok" ? (p.url ?? GROK_DEFAULT_URL) : p.url;
       let reachable = false;
       try {
         const u = new URL(url);
@@ -419,6 +732,8 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         url,
         type: p.type,
         reachable,
+        usable: reachable && !health[name],
+        ...(health[name] ? { exhaustion: health[name] } : {}),
         // Whether the router could run a `WebSearch` side request through this provider, so the
         // Clients screen can say so beside a model name. Nothing on that screen said which ones
         // those are, and a `smallFast` slot pointed at one turns every search into a visible failure
@@ -431,9 +746,15 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         // events — a backend the router does not have, so a search still cannot go through it.
         // Naming the provider's own capability instead would be a promise the router cannot keep.
         ...(providerCanSearch(name, cfg) ? { webSearch: true } : {}),
+        // A provider whose plan searches on another endpoint does so for some models only.
+        ...(() => {
+          const models = (("models" in p && p.models) || []).map((m) => typeof m === "string" ? m : m.id).filter((id) => searchProviderFor(p, id));
+          return models.length ? { webSearchModels: models } : {};
+        })(),
         // Reaching the host says nothing about being able to use it: a chatgpt provider with no
         // credentials is not "connected", and calling it that sends the user off believing it works.
         ...(p.type === "chatgpt" ? { needsLogin: !chatgptSignedIn(p.auth) } : {}),
+        ...(p.type === "grok" ? { needsLogin: !grokSignedIn(p) } : {}),
         ...(p.type === "google" && p.auth === "antigravity" ? googleHealth(deps.google?.().accounts?.()[name] ?? []) : {}),
         ...(p.type === "anthropic"
           ? {
@@ -446,31 +767,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
     }),
   );
   for (const [name, entry] of checked) providers[name] = entry;
-  const chatgpt = deps.chatgpt?.() ?? { quota: {}, auth: {} };
-  // A snapshot from response headers ages the moment GPT traffic stops: measured 2026-09-20, the
-  // status route showed 1% from 11 hours earlier while the account was at 40%. Past ten minutes,
-  // ask the backend directly. The lookup shares one in-flight promise per provider, so concurrent
-  // status polls (the GUI does one every 5s) collapse into a single request. A failed lookup keeps
-  // the last good numbers and says why, rather than blanking the read the budget decision uses.
-  const STALE_MS = 10 * 60 * 1000;
-  const staleReasons: Record<string, string> = {};
-  const refresh = deps.chatgpt?.().refresh;
-  if (refresh) {
-    const now = Date.now();
-    for (const [name, q] of Object.entries(chatgpt.quota)) {
-      const at = q && typeof q.at === "number" ? q.at : 0;
-      if (!opts.refresh && at && now - at < STALE_MS) continue;
-      const fresh = await refresh(name);
-      if (fresh) chatgpt.quota[name] = fresh;
-      else staleReasons[name] = opts.refresh ? "refresh requested but lookup failed" : "lookup failed; showing last known value";
-    }
-  }
-  const stale = Object.keys(staleReasons).length > 0;
-  const signedIn: Record<string, boolean> = {};
-  for (const [name, p] of Object.entries(cfg.providers)) {
-    if (p.type !== "chatgpt") continue;
-    signedIn[name] = chatgptSignedIn(p.auth);
-  }
+  const chatgpt = await chatgptStatus(deps, opts);
   const env = readSettingsEnv();
   const wantProxy = `http://127.0.0.1:${cfg.listen.port}`;
   const picker = deps.picker?.() ?? { enabled: false, hosts: [], last: null };
@@ -488,6 +785,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   for (const [name, p] of Object.entries(providers)) if (p.reachable === false) problems.push(`provider:${name}`);
   return {
     version: deps.version,
+    autoUpdate: deps.autoUpdater?.status() ?? { enabled: cfg.autoUpdate !== false, running: false },
     readiness: { ready: problems.length === 0, problems },
     // Which files this process is running, so the app can tell an old router from its own after
     // an update: a zip unpacked next to the previous install left the old one serving (2026-09-15).
@@ -508,15 +806,14 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
     cliVersion: cliVersion(),
     // `quota` stays one snapshot per provider (the account in use) for the readers that want one
     // number; `accounts` is the per-account view, read after the refresh above so it is as fresh.
-    chatgpt: { ...chatgpt, signedIn, accounts: chatgpt.accounts?.() ?? {}, ...(stale ? { stale: true, staleReason: staleReasons } : {}) },
+    chatgpt,
     ...(deps.claudeUsage && hasClaudeSubscription(cfg) ? { claude: { accounts: await claudeAccountUsage(deps) } } : {}),
     // Only present for providers that declare a pool; a provider with one credential has nothing
     // to report and would only add a row that never changes.
     credentials: deps.credentials?.() ?? {},
     picker,
-    agentTitle: agentTitleHookEnabled(),
     statusMod: statusModEnabled(),
-    pickerModels: cfg.cli.extraModels.map((m) => m.name || m.model),
+    pickerModels: chatPickerModels(cfg).map((m) => m.name || m.model),
     uiRevision: uiRevision(),
   };
 }
@@ -534,48 +831,6 @@ function pickerTrust(): { caTrusted: boolean; appProxy: boolean } {
   }
   pickerTrustMemo = { at: now, value };
   return value;
-}
-
-/** The ClaudeRipple CLI and the Node that installed us (`<home>/paths.json`, written by `install`). */
-function cliInvocation(): { node: string; cli: string; env: NodeJS.ProcessEnv } {
-  let node = process.execPath;
-  // Same walk either way; the extension says which layout this file was loaded from.
-  let cli = path.resolve(here, `../../cli/src/index${path.extname(fileURLToPath(import.meta.url))}`);
-  let runtimeEnv: Record<string, string> = {};
-  try {
-    const p = JSON.parse(fs.readFileSync(path.join(homeDir(), "paths.json"), "utf8")) as { node?: string; env?: Record<string, string>; cli?: string };
-    if (p.node) node = p.node;
-    if (p.env) runtimeEnv = p.env;
-    if (p.cli) cli = p.cli;
-  } catch {
-    /* not installed via the CLI: fall back to our own node + repo layout */
-  }
-  return { node, cli, env: { ...process.env, ...runtimeEnv, CLAUDERIPPLE_HOME: homeDir() } };
-}
-
-function runCli(args: string[], timeout = 180_000): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolveP) => {
-    const { node, cli, env } = cliInvocation();
-    execFile(node, [cli, ...args], { env, timeout }, (err, stdout, stderr) => {
-      resolveP({ ok: !err, output: `${stdout}${stderr}${err ? `\n${err.message}` : ""}`.trim() });
-    });
-  });
-}
-
-/**
- * Start the CLI in its own process group, writing to `log`. An update ends by restarting this
- * router, and launchd stops a job by killing its whole process group — an ordinary child would die
- * with the router halfway through the install that restarted it.
- */
-function startCliDetached(args: string[], log: string): void {
-  const { node, cli, env } = cliInvocation();
-  fs.mkdirSync(path.dirname(log), { recursive: true });
-  const out = fs.openSync(log, "w");
-  try {
-    spawn(node, [cli, ...args], { env, detached: true, stdio: ["ignore", out, out], windowsHide: true }).unref();
-  } finally {
-    fs.closeSync(out);
-  }
 }
 
 /**
@@ -656,15 +911,16 @@ export function parseImageRequest(raw: unknown): ImageRequest | string {
   return out;
 }
 
-function readBody(req: http.IncomingMessage, limit = MAX_BODY): Promise<Buffer> {
+function readBody(req: http.IncomingMessage, limit = MAX_BODY, overflowError?: Error): Promise<Buffer> {
   return new Promise((resolveP, reject) => {
     const chunks: Buffer[] = [];
     let n = 0;
     req.on("data", (c: Buffer) => {
       n += c.length;
       if (n > limit) {
-        reject(new Error("body too large"));
-        req.destroy();
+        chunks.length = 0;
+        reject(overflowError ?? new Error("body too large"));
+        if (!overflowError) req.destroy(); // mod saves must receive their 413, not a reset
         return;
       }
       chunks.push(c);
@@ -721,11 +977,17 @@ function codexState(): { enabled: boolean; codexHome: string; configPath: string
 }
 
 function claudeAuthStore(deps: AdminDeps): ClaudeCodeAuthStore {
-  return new ClaudeCodeAuthStore(undefined, { home: homeDir(), ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}) });
+  return new ClaudeCodeAuthStore(undefined, {
+    home: homeDir(),
+    ...(deps.observedClaudeCodeAuth ? { observed: deps.observedClaudeCodeAuth } : {}),
+    ...(deps.claudeCodeCredentialReaders ? { credentialReaders: deps.claudeCodeCredentialReaders } : {}),
+  });
 }
 
 async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
-  const models = CLAUDE_MODEL_FALLBACK;
+  // The key's own model list where it answers; a key that cannot list is still tested below.
+  const listed = await fetchClaudeModels("https://api.anthropic.com", { "x-api-key": apiKey }, probeFetch).catch(() => []);
+  const models: ModelEntry[] = listed.length ? listed.map(({ line: _line, createdAt: _createdAt, ...model }) => model) : CLAUDE_MODEL_FALLBACK;
   const label = "messages endpoint";
   try {
     const response = await probeFetch("https://api.anthropic.com/v1/messages", {
@@ -744,14 +1006,14 @@ async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, in
   }
 }
 
-function probeClaudeCodeAuth(deps: AdminDeps): { ok: boolean; auth: "ok" | "missing"; source: "observed" | "env" | "keychain" | "credentials-file" | "token-file" | null; signedIn: "oauth" | "setup-token" | null; accountCount: number; models: ModelEntry[] } {
+async function probeClaudeCodeAuth(deps: AdminDeps): Promise<{ ok: boolean; auth: "ok" | "missing"; source: "observed" | "env" | "keychain" | "credentials-file" | "token-file" | null; signedIn: "oauth" | "setup-token" | null; accountCount: number; models: ModelEntry[] }> {
   const source = claudeAuthStore(deps).describeSource();
   // Our own accounts are reported separately: a Claude Desktop session can outrank them, and without
   // this the screen would answer a finished sign-in with the source it was already showing.
   const accounts = listClaudeAccounts(homeDir());
   const hasUsableAccount = accounts.some((account) => !account.needsReauth && account.expiresAt > Date.now());
   const signedIn = accounts.length > 0 ? "oauth" : readClaudeAuthFile(homeDir())?.source ?? null;
-  return { ok: source !== null || hasUsableAccount, auth: source !== null || hasUsableAccount ? "ok" : "missing", source, signedIn, accountCount: accounts.length, models: CLAUDE_MODEL_FALLBACK };
+  return { ok: source !== null || hasUsableAccount, auth: source !== null || hasUsableAccount ? "ok" : "missing", source, signedIn, accountCount: accounts.length, models: await claudeModelList(deps) };
 }
 
 /** The reasoning levels a `GET /v1beta/models` entry says the model takes, or none to offer. */
@@ -828,8 +1090,64 @@ async function probeGoogleAntigravity(deps: AdminDeps): Promise<{ ok: boolean; a
   return { ok: true, auth: "ok", models: models ?? staticAntigravityModels() };
 }
 
+type GrokProbeResult = { ok: boolean; auth: ProbeAuth; models: ModelEntry[]; modelsSource: "catalog" | "fallback"; warning: string; error?: string };
+
+/**
+ * `{type:"grok"}`: whether the Grok CLI's session is usable, and the models its chat proxy lists.
+ * The session goes through the same `GrokAuth` the adapter uses — one near its end is refreshed
+ * through the CLI here too — and the listing is asked with the headers live traffic sends, since a
+ * test that presents another auth set certifies a path nobody uses (§5).
+ */
+async function probeGrok(
+  body: { home?: unknown; cli?: unknown; url?: unknown; clientVersion?: unknown },
+  log: Logger,
+  probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout,
+): Promise<GrokProbeResult> {
+  const text = (value: unknown): string | undefined => typeof value === "string" && value ? value : undefined;
+  const home = text(body.home) ?? grokHome();
+  const cli = text(body.cli);
+  const clientVersion = text(body.clientVersion);
+  const fallback = (result: Omit<GrokProbeResult, "models" | "modelsSource" | "warning">): GrokProbeResult =>
+    ({ ...result, models: GROK_FALLBACK_MODELS, modelsSource: "fallback", warning: GROK_WARNING });
+  const versionProblem = clientVersion ? headerValueProblem(clientVersion) : null;
+  if (versionProblem) return fallback({ ok: false, auth: "unknown", error: `clientVersion cannot be sent as a header: ${versionProblem}` });
+  // The adapter's own instance for this session, so a probe joins a refresh a turn started (and the
+  // reverse) instead of spawning a second CLI.
+  const auth = sharedGrokAuth({ home, ...(cli ? { cli } : {}), log });
+  let token;
+  try {
+    token = await auth.token();
+  } catch (error) {
+    return fallback({ ok: false, auth: "missing", error: errorText(error) });
+  }
+  const base = (text(body.url) ?? GROK_DEFAULT_URL).replace(/\/+$/, "");
+  const { "x-grok-model-override": _route, ...headers } = grokHeaders(token.key, "", await auth.clientVersion(clientVersion));
+  let response: Response;
+  try {
+    response = await probeFetch(`${base}/models`, { headers });
+  } catch (error) {
+    // fetch quotes a header value it refuses, which here is the session token.
+    return fallback({ ok: false, auth: "unreachable", error: redactErrorText(errorText(error), [token.key]) });
+  }
+  if (response.status === 401 || response.status === 403) {
+    return fallback({ ok: false, auth: "bad-key", error: `the proxy refused the Grok session (HTTP ${response.status}): ${GROK_AUTH_HINT}` });
+  }
+  if (!response.ok) {
+    const detail = redactErrorText(await response.text().catch(() => ""), [token.key]);
+    return fallback({ ok: false, auth: "unknown", error: `HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}` });
+  }
+  const models = grokModelsFromListing(await response.json().catch(() => null));
+  return models.length
+    ? { ok: true, auth: "ok", models, modelsSource: "catalog", warning: GROK_WARNING }
+    : fallback({ ok: true, auth: "ok" });
+}
+
 function chatCompletionsUrl(base: string): string {
   return `${base.replace(/\/+$/, "")}/chat/completions`;
+}
+
+function responsesUrl(base: string): string {
+  return `${base.replace(/\/+$/, "")}/responses`;
 }
 
 function errorText(error: unknown): string {
@@ -937,12 +1255,21 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
   }
 
   const openai = body.type === "openai-compatible";
-  const checkUrl = openai ? chatCompletionsUrl(body.url) : messagesUrl(body.url);
+  // A preset's test model is picked for Chat Completions (see `presetProbeModel`), so only a provider
+  // entered by hand is tested on Responses: one that serves nothing else answered the Chat test 404.
+  const responses = openai && body.wire === "responses" && !body.preset;
+  const checkUrl = responses ? responsesUrl(body.url) : openai ? chatCompletionsUrl(body.url) : messagesUrl(body.url);
   const checkModel = presetProbeModel(body.preset) ?? models[0]?.id ?? body.probeModel ?? "test";
-  const checkBody = openai
-    ? { model: checkModel, max_tokens: 1, stream: false, messages: [{ role: "user", content: "hi" }] }
-    : { model: checkModel, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
-  const label = openai ? "chat completions endpoint" : "messages endpoint";
+  // 16 tokens, as on Responses: some vendors refuse a smaller cap outright (B.ai: "max_tokens must be
+  // greater than 2", #57), which read as a failed connection though the key and URL were right.
+  // Streamed, as every translated turn is: the status arrives with the headers, while a reasoning
+  // model answering whole can take past the timeout (Hive: 0.3s streamed, 3–23s whole, 2026-10-18).
+  const checkBody = responses
+    ? { model: checkModel, max_output_tokens: 16, stream: true, store: false, input: "hi" }
+    : openai
+      ? { model: checkModel, max_tokens: 16, stream: true, messages: [{ role: "user", content: "hi" }] }
+      : { model: checkModel, max_tokens: 16, messages: [{ role: "user", content: "hi" }] };
+  const label = responses ? "responses endpoint" : openai ? "chat completions endpoint" : "messages endpoint";
   try {
     const response = await probeFetch(checkUrl, {
       method: "POST",
@@ -958,7 +1285,10 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
       const auth: ProbeAuth = response.status === 403 && refusedByPlan(refusal) ? "not-entitled" : "bad-key";
       return { ok: false, auth, models, error: `${label} returned ${response.status}: ${refusal}` };
     }
-    if (response.ok) return { ok: true, auth: "ok", models, ...(modelsError ? { error: modelsError } : {}) };
+    if (response.ok) {
+      await response.body?.cancel().catch(() => {});
+      return { ok: true, auth: "ok", models, ...(modelsError ? { error: modelsError } : {}) };
+    }
     const detail = snippet(await response.text());
     // A model-validation refusal still demonstrates that the endpoint reached the provider and the key was accepted.
     if (refusedForModel(response.status, detail)) {
@@ -1038,20 +1368,26 @@ function measureCandidates(p: Provider, modelId?: string, catalogWire?: WireCand
   const known = "preset" in p && p.preset
     ? PRESETS.find((entry) => entry.id === p.preset)?.fallbackModels?.find((m) => m.id === modelId)
     : undefined;
-  if (known?.wire) add({ wire: known.wire, url: known.url ?? ownUrl, ...(known.authHeader ? { authHeader: known.authHeader } : {}) });
+  // The Gemini wire is not one `capabilities.ts` speaks: it has its own endpoint shape and header,
+  // so a model the preset records on it is not tried on the other three (a request there would
+  // answer 404/protocol-error and read as a model the plan refuses). Its wire stays as declared.
+  if (known?.wire && known.wire !== "google") add({ wire: known.wire, url: known.url ?? ownUrl, ...(known.authHeader ? { authHeader: known.authHeader } : {}) });
   add(own);
   if (p.type === "openai-compatible" && p.preset) {
     // One plan can serve several wires on one catalog. The preset's fallback list is the only place
     // any of that mapping is written down, so it is what the remaining candidates are read from.
     const preset = PRESETS.find((entry) => entry.id === p.preset);
-    for (const model of preset?.fallbackModels ?? []) add({ wire: model.wire ?? defaultWire, url: model.url ?? p.url, ...(model.authHeader ? { authHeader: model.authHeader } : {}) });
+    for (const model of preset?.fallbackModels ?? []) {
+      if (model.wire === "google") continue;
+      add({ wire: model.wire ?? defaultWire, url: model.url ?? p.url, ...(model.authHeader ? { authHeader: model.authHeader } : {}) });
+    }
   } else if (p.type === "openai-compatible") {
     // No table to read: the two OpenAI wires this kind of provider could be serving.
     add({ wire: "responses", url: p.url });
     add({ wire: "chat", url: p.url });
   } else if (p.type === "anthropic-compatible" && p.preset) {
     const preset = PRESETS.find((entry) => entry.id === p.preset);
-    for (const model of preset?.fallbackModels ?? []) if (model.wire) add({ wire: model.wire, url: model.url ?? p.url, ...(model.authHeader ? { authHeader: model.authHeader } : {}) });
+    for (const model of preset?.fallbackModels ?? []) if (model.wire && model.wire !== "google") add({ wire: model.wire, url: model.url ?? p.url, ...(model.authHeader ? { authHeader: model.authHeader } : {}) });
   }
   if (!known?.wire && catalogWire) {
     const at = candidates.findIndex((c) => c.wire === catalogWire);
@@ -1068,12 +1404,32 @@ function providerLadder(p: Provider): string[] {
 }
 
 /**
+ * Whether nothing says what effort this provider's models take, so a request strips it: the case
+ * worth measuring a model for. Read the way the request path reads it. An anthropic-compatible
+ * provider falls back to its preset live (`compatCaps` in proxy.ts) and strips on an empty ladder; the
+ * OpenAI adapter reads only its own `caps`, and `reasoning: "effort"` with no levels passes effort
+ * through as asked. An anthropic-compatible ladder the config states is a decision, even an empty
+ * one. `reasoning: "none"` is not: the provider form writes it for every OpenAI-compatible provider
+ * whose preset has no ladder (Groq, Mistral, a key and a URL), with no control to say otherwise.
+ */
+function effortUndeclared(p: Provider): boolean {
+  if (p.type === "anthropic-compatible") {
+    if (p.caps?.effortLevels !== undefined) return false;
+    const preset = p.preset ? PRESETS.find((entry) => entry.id === p.preset) : undefined;
+    return (preset?.effortLevels ?? []).length === 0;
+  }
+  if (p.type === "openai-compatible") return p.caps?.reasoning !== "effort";
+  return false;
+}
+
+/**
  * Fold measurements into the config on disk.
  *
  * Read again here rather than reusing what the job started with: the user may have saved from the
  * GUI while the measurements ran, and writing back a stale copy would silently revert that save.
- * Only a model that is still present is touched, and only into a blank field — a `wire` or
- * `effortLevels` already on the model is the user's, and an explicitly empty array is a decision
+ * Only a model that is still present is touched, and only into a blank field — a `wire`,
+ * `effortLevels` or `contextWindow` already on the model is the user's or the vendor's, and an
+ * explicitly empty ladder is a decision
  * (it disables the provider fallback), not an empty slot. A model whose measurement errored is
  * left entirely alone. The result is validated with the same `validate` the GUI's save uses, so a
  * bad edit is refused rather than written.
@@ -1092,16 +1448,138 @@ function applyMeasurements(configFile: string, results: Measured[]): { applied: 
       if (!("models" in provider) || !provider.models) continue;
       const model = provider.models.find((entry) => entry.id === result.id);
       if (!model) continue;
-      const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}`;
+      const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
       if (model.wire === undefined) model.wire = result.wire;
       if (model.effortLevels === undefined && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
-      if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}` !== before) applied++;
+      if (model.contextWindow === undefined && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
+      if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
     }
   }
   const errors = validate(current);
   if (errors.length > 0) return { error: `measured config did not validate: ${errors[0]}` };
   writeConfigFile(configFile, current);
   return { applied };
+}
+
+/** Register a measurement job and run it detached; returns the id a caller polls. */
+function startMeasureJob(providerName: string, models: string[], deps: AdminDeps): string {
+  sweepMeasureJobs();
+  const jobId = crypto.randomBytes(12).toString("hex");
+  MEASURE_JOBS.set(jobId, { state: "running", done: 0, total: models.length, results: [] });
+  deps.log.info(`admin: measuring ${providerName} (${models.length} model(s)) -> ${jobId.slice(0, 8)}`);
+  void runMeasureJob(jobId, providerName, models, deps);
+  return jobId;
+}
+
+/**
+ * Measure the models whose effort is still stripped and that nobody has settled, without waiting
+ * for a save in the GUI. A model was measured only when its provider was saved, so a provider set up
+ * before effort discovery — every DeepSeek, Kimi or GLM key on 0.8.1 and earlier — would otherwise
+ * stay without effort until its owner happened to save it again. A model with a ladder (measured,
+ * or typed) is the config's and left alone; so is one whose provider declares a ladder.
+ */
+export function measureUnsettledModels(deps: AdminDeps): number {
+  let started = 0;
+  for (const [name, provider] of Object.entries(deps.config().providers)) {
+    if (provider.type !== "openai-compatible" && provider.type !== "anthropic-compatible") continue;
+    if (!effortUndeclared(provider)) continue;
+    const models = (provider.models ?? []).filter((model) => model.effortLevels === undefined).map((model) => model.id);
+    if (models.length === 0) continue;
+    startMeasureJob(name, models, deps);
+    started++;
+  }
+  return started;
+}
+
+/**
+ * Give models already saved without a context window the one the catalogue states.
+ *
+ * OpenCode's `/models` reports ids alone, so a provider set up before the catalogue's `limit.context`
+ * was read keeps no window and falls back to `cli.autoCompactWindow` — a quarter of a 1M model's real
+ * window. The measurement folds the catalogue's window in, but only over the models it runs on and
+ * only through its own write; this pass reaches the models already on disk, once, at start-up. Only
+ * into a blank field, through the same validated write, so a window the user or the vendor set is
+ * never overwritten. Returns the `provider/model` ids it filled.
+ */
+export async function backfillContextWindows(deps: AdminDeps): Promise<string[]> {
+  const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
+  if (!catalog) {
+    deps.log.warn("admin: context windows not backfilled: the catalogue could not be had");
+    return [];
+  }
+  let current: Config;
+  try {
+    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
+  } catch (e) {
+    deps.log.warn(`admin: context windows not backfilled: could not read config: ${errorText(e)}`);
+    return [];
+  }
+  const filled: string[] = [];
+  for (const [name, provider] of Object.entries(current.providers)) {
+    if (!("models" in provider) || !provider.models) continue;
+    const preset = "preset" in provider ? provider.preset : undefined;
+    for (const model of provider.models) {
+      if (model.contextWindow !== undefined) continue;
+      const entry = catalogEntry(catalog, preset, model.id);
+      if (entry?.contextWindow === undefined) continue;
+      model.contextWindow = entry.contextWindow;
+      filled.push(`${name}/${model.id}`);
+      deps.log.info(`admin: ${name}/${model.id} context window ${entry.contextWindow} (catalogue)`);
+    }
+  }
+  if (filled.length === 0) return [];
+  const errors = validate(current);
+  if (errors.length > 0) {
+    deps.log.warn(`admin: context windows not backfilled: config did not validate: ${errors[0]}`);
+    return [];
+  }
+  writeConfigFile(deps.configFile, current);
+  return filled;
+}
+
+/**
+ * Declare each Claude release the account has gained on every native Anthropic provider that
+ * declares an older model of the same family (`newClaudeReleases`). The declared list was whatever
+ * was ticked when the provider was saved, so Opus 5.5, Sonnet 5.5 and Haiku 5.5 stayed off it for
+ * weeks while Claude Code had them (2026-10-08). A model offered once is remembered in
+ * `claude-models-offered.json` and never offered again, so unticking a new model sticks.
+ * Returns the `provider/model` ids it declared.
+ */
+export async function adoptNewClaudeModels(deps: AdminDeps): Promise<string[]> {
+  const live = await deps.claudeModels?.().catch(() => null);
+  if (!live?.length) return [];
+  const stateFile = path.join(homeDir(), "claude-models-offered.json");
+  let offered = new Set<string>();
+  try {
+    const saved = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { offered?: unknown };
+    if (Array.isArray(saved.offered)) offered = new Set(saved.offered.filter((id): id is string => typeof id === "string"));
+  } catch { /* first run: nothing offered yet */ }
+  let current: Config;
+  try {
+    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
+  } catch (e) {
+    deps.log.warn(`admin: claude models not adopted: could not read config: ${errorText(e)}`);
+    return [];
+  }
+  const added: string[] = [];
+  for (const [name, provider] of Object.entries(current.providers)) {
+    if (provider.type !== "anthropic" || !provider.models?.length) continue;
+    for (const model of newClaudeReleases(live, provider.models.map((entry) => entry.id), offered)) {
+      provider.models.push({ id: model.id, name: model.name ?? model.id });
+      added.push(`${name}/${model.id}`);
+    }
+  }
+  if (added.length) {
+    const errors = validate(current);
+    if (errors.length > 0) {
+      deps.log.warn(`admin: claude models not adopted: config did not validate: ${errors[0]}`);
+      return [];
+    }
+    writeConfigFile(deps.configFile, current);
+    deps.log.info(`admin: declared new Claude model(s): ${added.join(", ")}`);
+  }
+  fs.writeFileSync(stateFile, JSON.stringify({ offered: [...new Set([...offered, ...live.map((model) => model.id)])].sort() }, null, 2) + "\n");
+  return added;
 }
 
 /** Run one provider measurement job to completion. Detached: the request that started it has already answered. */
@@ -1114,6 +1592,9 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     return;
   }
   const ladder = providerLadder(provider);
+  // No ladder from the provider, its preset or the config: find out per model whether it takes
+  // effort at all (`discoverLadder`), rather than leave it stripped.
+  const discover = effortUndeclared(provider);
   const fetchImpl = deps.measureFetch ?? measureFetchWithTimeout;
   const headers = "headers" in provider ? provider.headers : undefined;
   const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
@@ -1125,10 +1606,13 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     const candidates = measureCandidates(provider, id, listed?.wire);
     // A ladder the catalogue states is taken as stated; the wire is still asked, once, because that
     // one request is also what finds a model the plan refuses (403 FreeTierError, DataPolicyError).
-    const stated = ladder.length > 0 ? listed?.effortLevels : undefined;
+    const stated = ladder.length > 0 || discover ? listed?.effortLevels : undefined;
     const known = stated !== undefined;
-    const measured = await measureModel(id, candidates, known ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) });
+    const measured = await measureModel(id, candidates, known ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }, { discover: discover && !known });
     if (stated && measured.wire) measured.effortLevels = stated;
+    // The wire was answered, so the model exists: the catalogue's own window travels with the result
+    // and is written only into a model that has none (see applyMeasurements).
+    if (measured.wire && listed?.contextWindow !== undefined) measured.contextWindow = listed.contextWindow;
     job.results.push(measured);
     job.done++;
     deps.log.info(`admin: measured ${providerName}/${id} -> ${measured.error ? `error ${measured.error}` : `wire ${measured.wire}${measured.effortLevels ? ` effort ${measured.effortLevels.join(",")}${known ? " (catalogue)" : ""}` : ""}`}`);
@@ -1154,7 +1638,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   }
 }
 
-function pickerModels(deps: AdminDeps): { models: { id: string; name: string }[]; source: "picker" | "fallback" } {  const last = deps.picker?.().last;
+async function pickerModels(deps: AdminDeps): Promise<{ models: { id: string; name: string }[]; source: "picker" | "fallback" }> {  const last = deps.picker?.().last;
   if (last && typeof last === "object" && Array.isArray((last as { surfaces?: unknown }).surfaces)) {
     const entries = (last as { surfaces: { id?: unknown; entries?: unknown }[] }).surfaces
       .filter((surface) => surface.id === "code" || surface.id === "ccd")
@@ -1170,13 +1654,32 @@ function pickerModels(deps: AdminDeps): { models: { id: string; name: string }[]
     const injected = new Set(deps.config().cli.extraModels.map((m) => m.model));
     const seen = new Set<string>();
     const models = entries.filter((e) => {
-      if (injected.has(e.id) || seen.has(e.id)) return false;
+      if (injected.has(e.id) || seen.has(e.id) || isJudgeOnlyModel(e.id)) return false;
       seen.add(e.id);
       return true;
     });
     if (models.length > 0) return { models, source: "picker" };
   }
-  return { models: CLAUDE_MODEL_FALLBACK, source: "fallback" };
+  return { models: await claudeModelList(deps), source: "fallback" };
+}
+
+/**
+ * Each model's context window, for a client that reads a session's context use without the CLI's own
+ * figure (the phone, for a Claude app session). Claude's from Anthropic's catalog, the CLI's injected
+ * models from their config (else `cli.autoCompactWindow`), providers' from theirs. Unknown is absent.
+ */
+async function contextWindows(deps: AdminDeps): Promise<{ windows: Record<string, number> }> {
+  const cfg = deps.config();
+  const windows: Record<string, number> = {};
+  const put = (id: string, value: number | undefined): void => {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0 && windows[id] === undefined) windows[id] = Math.floor(value);
+  };
+  for (const model of await claudeModelList(deps)) put(model.id, model.contextWindow);
+  for (const model of cfg.cli.extraModels) put(model.model, model.contextWindow ?? cfg.cli.autoCompactWindow);
+  for (const provider of Object.values(cfg.providers)) {
+    for (const model of ("models" in provider && provider.models) || []) put(model.id, model.contextWindow);
+  }
+  return { windows };
 }
 
 function tailLines(file: string, n: number): string {
@@ -1190,7 +1693,9 @@ function tailLines(file: string, n: number): string {
 
 function safeStaticPath(urlPath: string): string | null {
   const decoded = decodeURIComponent(urlPath.split("?")[0] ?? "/");
-  const rel = decoded === "/" ? "index.html" : decoded.replace(/^\/+/, "");
+  // Clients that ask for /favicon.ico without reading the page's <link rel="icon"> get the PNG;
+  // browsers sniff the bytes, so a PNG served for .ico shows.
+  const rel = decoded === "/" ? "index.html" : decoded === "/favicon.ico" ? "favicon-32.png" : decoded.replace(/^\/+/, "");
   const full = path.resolve(UI_ROOT, rel);
   const rootWithSep = UI_ROOT.endsWith(path.sep) ? UI_ROOT : UI_ROOT + path.sep;
   if (full !== UI_ROOT && !full.startsWith(rootWithSep)) return null; // path traversal guard
@@ -1235,8 +1740,18 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
 }
 
 export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): void }> {
+  // Standalone admin users share the same coordinator, but only the router entry starts scheduling.
+  const updater = deps.autoUpdater ?? new AutoUpdater({
+    home: homeDir(), version: deps.version, enabled: () => deps.config().autoUpdate !== false,
+    activity: () => ({ inFlight: 0 }), log: deps.log,
+    runCli: deps.runCli ?? runCli, startCliDetached: deps.startCliDetached ?? startCliDetached,
+  });
+  deps = { ...deps, autoUpdater: updater };
+  const scores = new ModelScoreCatalog({ home: homeDir(), warn: message => deps.log.warn(message), ...(deps.modelScoresFetch ? { fetch: deps.modelScoresFetch } : {}) });
   // Set again once the socket is bound (port 0 in tests); the Origin check below compares against it.
   let boundPort = adminPort(deps.config());
+  /** The dashboard's `awake setup` run in progress (or the last one), for GET /api/power/setup. */
+  let powerSetup: { running: boolean; startedAt?: string; finishedAt?: string; ok?: boolean; output?: string } = { running: false };
   const server = http.createServer((req, res) => {
     void handle(req, res);
   });
@@ -1271,6 +1786,23 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         sendJson(res, 403, { error: "cross-site request refused" });
         return;
       }
+      if (pathname.startsWith("/api/phone/")) {
+        res.setHeader("cache-control", "no-store");
+        // Pairing is a credential read: guard GETs too, including DNS-rebinding Host values.
+        if (crossSitePost(req) || req.headers["sec-fetch-site"] === "cross-site" ||
+          !new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`]).has(req.headers.host ?? "")) {
+          sendJson(res, 403, { error: "same-origin phone control required" });
+          return;
+        }
+        let body: string | undefined;
+        if (method === "POST" && pathname === "/api/phone/settings") {
+          try { body = (await readBody(req, 4096, new Error("phone settings too large"))).toString("utf8"); }
+          catch { sendJson(res, 413, { error: "phone settings too large" }); return; }
+        }
+        const result = await phoneRequest(pathname.slice("/api/phone/".length), method, body, deps.phone);
+        sendJson(res, result.status, result.body);
+        return;
+      }
       if (pathname === "/api/shutdown" && method === "POST") {
         if (!deps.shutdown) {
           sendJson(res, 501, { error: "shutdown not available" });
@@ -1280,6 +1812,78 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         // drain can outlive the connection (it waits for in-flight model calls, up to 90s).
         sendJson(res, 202, { draining: true });
         deps.shutdown();
+        return;
+      }
+      if (pathname === "/api/remote" && method === "GET") {
+        if (!deps.remote) { sendJson(res, 501, { error: "remote tunnels not available" }); return; }
+        sendJson(res, 200, { hosts: deps.remote.status() });
+        return;
+      }
+      if (pathname === "/api/remote/reload" && method === "POST") {
+        if (!deps.remote) { sendJson(res, 501, { error: "remote tunnels not available" }); return; }
+        sendJson(res, 200, { hosts: deps.remote.reload() });
+        return;
+      }
+      if (pathname === "/api/power" && (method === "GET" || method === "PUT")) {
+        if (!deps.power) { sendJson(res, 501, { error: "power control not available" }); return; }
+        if (method === "GET") { sendJson(res, 200, deps.power.status()); return; }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        const change = parsePowerChange(parsed);
+        if (typeof change === "string") { sendJson(res, 400, { error: change }); return; }
+        if (persistPowerChange(deps.configFile, change)) {
+          deps.log.info(`admin: power saved (${JSON.stringify({ ...(change.awake ? { awake: change.awake } : {}), ...(change.tether?.enabled !== undefined ? { tether: { enabled: change.tether.enabled } } : {}) })})`);
+        }
+        if (change.tether?.pin !== undefined) deps.power.pin(change.tether.pin);
+        await deps.power.poke();
+        sendJson(res, 200, deps.power.status());
+        return;
+      }
+      // The one privileged step, from the dashboard: the CLI's `awake setup`, which shows macOS's own
+      // password dialog. It runs in the background and is polled, like the ChatGPT sign-in: the user
+      // may take minutes to type, and the app's window gives up on a response with no headers after
+      // 4s (packages/app/src/protocol.ts) — a reply held open until the end would read as a dead router.
+      if (pathname === "/api/power/setup" && (method === "GET" || method === "POST")) {
+        if (!deps.power) { sendJson(res, 501, { error: "power control not available" }); return; }
+        if (method === "GET") { sendJson(res, 200, powerSetup); return; }
+        let parsed: unknown;
+        try {
+          const text = (await readBody(req, 4096)).toString("utf8");
+          parsed = text.trim() ? JSON.parse(text) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { sendJson(res, 400, { error: "expected an object" }); return; }
+        const extra = Object.keys(parsed).find((key) => key !== "ssid");
+        if (extra) { sendJson(res, 400, { error: `unknown field "${extra}"` }); return; }
+        const ssid = (parsed as { ssid?: unknown }).ssid;
+        if (ssid !== undefined) {
+          // Checked here too so a bad name is refused before a password dialog, not after it.
+          const problem = ssidProblem(ssid);
+          if (problem) { sendJson(res, 400, { error: problem }); return; }
+        }
+        if (powerSetup.running) { sendJson(res, 409, { error: "setup is already running", running: true }); return; }
+        powerSetup = { running: true, startedAt: new Date().toISOString() };
+        const args = ["awake", "setup", ...(typeof ssid === "string" ? ["--ssid", ssid] : [])];
+        deps.log.info(`admin: awake setup via GUI -> started${typeof ssid === "string" ? ` (hotspot "${ssid}")` : ""}`);
+        const power = deps.power;
+        // The CLI's own dialog times out at 5 min; this leaves it room to say so itself.
+        void (deps.runCli ?? runCli)(args, 330_000).then(
+          (result) => ({ ok: result.ok, output: result.output }),
+          (error: unknown) => ({ ok: false, output: errorText(error) }),
+        ).then(async (result) => {
+          powerSetup = { ...powerSetup, running: false, finishedAt: new Date().toISOString(), ...result };
+          deps.log.info(`admin: awake setup via GUI -> ${result.ok ? "ok" : "failed"}`);
+          // Re-read whether the rule is in place now, so the next GET /api/power says so.
+          try { await power.poke(); } catch { /* the next tick does it */ }
+        });
+        sendJson(res, 202, { started: true });
         return;
       }
       // Liveness is answering at all; readiness is 200 only when a request can actually go through.
@@ -1294,12 +1898,47 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         sendJson(res, 200, await buildStatus(deps, { refresh }));
         return;
       }
+      // One shape for every provider whose quota can be read, for the status bar's limits row.
+      if (pathname === "/api/limits" && method === "GET") {
+        sendJson(res, 200, await buildLimits(deps));
+        return;
+      }
+      if (pathname === "/api/mod-settings" && method === "GET") {
+        const snapshot = readModSettings();
+        // Filled here as well as on save, so a ladder with empty rungs (Auto migrated, or never set) reads whole to every surface.
+        sendJson(res, 200, { ...snapshot, settings: await withFilledLadder(deps, scores, snapshot.settings) });
+        return;
+      }
+      if (pathname === "/api/mod-settings" && method === "PUT") {
+        const bytes = await readBody(req, MAX_BODY, new ModSettingsInputError("body too large", 413));
+        let parsed: unknown;
+        try { parsed = JSON.parse(bytes.toString("utf8")); }
+        catch { throw new ModSettingsInputError("invalid JSON"); }
+        validateSettingsSchema(parsed);
+        const body = parsed as { settings?: unknown };
+        if (body && typeof body === "object" && body.settings && typeof body.settings === "object" && !Array.isArray(body.settings)) {
+          // Checked before normalizing, which would drop a credential field the check is there to refuse.
+          validateSettings(body.settings);
+          body.settings = await withFilledLadder(deps, scores, normalizeSettings(body.settings));
+        }
+        const result = writeModSettings(parsed);
+        sendJson(res, result.stale ? 409 : 200, result.current);
+        return;
+      }
+      if (pathname === "/api/mod-options" && method === "GET") {
+        sendJson(res, 200, await modOptions(deps, scores));
+        return;
+      }
       if (pathname === "/api/presets" && method === "GET") {
         sendJson(res, 200, { presets: PRESETS satisfies ProviderPreset[] });
         return;
       }
       if (pathname === "/api/claude-models" && method === "GET") {
-        sendJson(res, 200, pickerModels(deps));
+        sendJson(res, 200, await pickerModels(deps));
+        return;
+      }
+      if (pathname === "/api/context-windows" && method === "GET") {
+        sendJson(res, 200, await contextWindows(deps));
         return;
       }
       if (pathname === "/api/effort-levels" && method === "GET") {
@@ -1325,10 +1964,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "expected provider probe object" });
           return;
         }
-        const probe = parsed as { type?: unknown; name?: unknown; auth?: unknown; apiKey?: unknown; url?: unknown; headers?: unknown; modelsUrl?: unknown; modelsAuthHeader?: unknown; probeModel?: unknown; sessionHeader?: unknown; preset?: unknown };
+        const probe = parsed as { type?: unknown; name?: unknown; auth?: unknown; apiKey?: unknown; url?: unknown; headers?: unknown; modelsUrl?: unknown; modelsAuthHeader?: unknown; probeModel?: unknown; sessionHeader?: unknown; preset?: unknown; wire?: unknown; home?: unknown; cli?: unknown; clientVersion?: unknown };
         if (probe.type === "anthropic") {
           if (probe.auth === "claude-code") {
-            sendJson(res, 200, probeClaudeCodeAuth(deps));
+            sendJson(res, 200, await probeClaudeCodeAuth(deps));
             return;
           }
           if (probe.auth === "api-key") {
@@ -1361,6 +2000,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           });
           return;
         }
+        if (probe.type === "grok") {
+          sendJson(res, 200, await probeGrok(probe, deps.log, deps.probeFetch));
+          return;
+        }
         if (probe.type === "google") {
           if (probe.auth === "antigravity") {
             sendJson(res, 200, await probeGoogleAntigravity(deps));
@@ -1389,6 +2032,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           ...(probe.modelsAuthHeader ? { modelsAuthHeader: probe.modelsAuthHeader } : {}),
           ...(typeof probe.preset === "string" && probe.preset ? { preset: probe.preset } : {}),
           ...(typeof probe.probeModel === "string" ? { probeModel: probe.probeModel } : {}),
+          ...(probe.wire === "chat" || probe.wire === "responses" ? { wire: probe.wire } : {}),
         }, deps.probeModelFetch ?? fetchWithTimeout);
         sendJson(res, 200, result);
         return;
@@ -1413,13 +2057,8 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: `provider "${body.provider}" is not openai-compatible or anthropic-compatible` });
           return;
         }
-        sweepMeasureJobs();
-        const jobId = crypto.randomBytes(12).toString("hex");
-        const job: MeasureJob = { state: "running", done: 0, total: body.models.length, results: [] };
-        MEASURE_JOBS.set(jobId, job);
-        deps.log.info(`admin: measuring ${body.provider} (${body.models.length} model(s)) -> ${jobId.slice(0, 8)}`);
-        void runMeasureJob(jobId, body.provider, body.models as string[], deps);
-        sendJson(res, 202, { jobId, total: job.total });
+        const jobId = startMeasureJob(body.provider, body.models as string[], deps);
+        sendJson(res, 202, { jobId, total: body.models.length });
         return;
       }
       if (pathname.startsWith("/api/providers/measure/") && method === "GET") {
@@ -1585,6 +2224,28 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           current: source ? { id: "current", label: "Current Claude login", source, external: true, ...(usage.current ? { quota: usage.current } : {}) } : null,
           accounts: listClaudeAccounts(homeDir()).map((account) => (usage[account.id] ? { ...account, quota: usage[account.id] } : account)),
         });
+        return;
+      }
+      // Which account a new conversation tries first: a stored account id, or null for the current login.
+      if (pathname === "/api/claude-accounts" && method === "PUT") {
+        let preferred: unknown;
+        try {
+          preferred = (JSON.parse((await readBody(req)).toString("utf8")) as { preferred?: unknown }).preferred;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON" });
+          return;
+        }
+        if (preferred === "current") preferred = null;
+        if (preferred !== null && (typeof preferred !== "string" || !preferred)) {
+          sendJson(res, 400, { error: "expected {preferred: account id or null}" });
+          return;
+        }
+        if (!setPreferredClaudeAccount(homeDir(), preferred)) {
+          sendJson(res, 404, { error: "Claude account not found" });
+          return;
+        }
+        deps.log.info(`admin: Claude accounts now try ${preferred === null ? "the current login" : `account ${preferred.slice(0, 8)}`} first`);
+        sendJson(res, 200, { ok: true });
         return;
       }
       if (pathname.startsWith("/api/claude-accounts/") && (method === "PATCH" || method === "DELETE")) {
@@ -1843,12 +2504,13 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         // The CLI answers both: it knows how this copy was installed, which decides what an update is
         // (the tray asks it the same way). A POST checks again rather than trusting the page.
         const r = await (deps.runCli ?? runCli)(["update", "--check", "--json"], 30_000);
-        const check = parseUpdateCheck(r.output);
+        const check = r.ok ? parseUpdateCheck(r.output) : null;
         if (!check) {
           sendJson(res, 502, { error: "could not check for updates", output: r.output.slice(-2000) });
           return;
         }
-        const running = updateStartedAt > 0 && Date.now() - updateStartedAt < UPDATE_RUN_MS;
+        updater.observe(check);
+        const running = updater.running();
         if (method === "GET") {
           sendJson(res, 200, { ...check, running });
           return;
@@ -1865,9 +2527,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 409, { error: "an update is already running", ...check, running });
           return;
         }
-        updateStartedAt = Date.now();
-        const log = path.join(homeDir(), "logs", "update.log");
-        (deps.startCliDetached ?? startCliDetached)(["update"], log);
+        const log = updater.install(check);
         deps.log.info(`admin: update ${check.current} -> ${check.latest ?? "?"} started via GUI (output in ${log})`);
         sendJson(res, 202, { started: true, ...check, log });
         return;
@@ -1893,9 +2553,12 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         // A caller that gives up should not leave the generation running on the subscription.
         const abort = new AbortController();
         res.on("close", () => { if (!res.writableFinished) abort.abort(); });
+        // The CLI's own session, so the request log shows which session generated the image.
+        const session = req.headers["x-claude-code-session-id"];
+        const meta = typeof session === "string" && /^[\w-]{1,128}$/.test(session) ? { session } : undefined;
         const started = Date.now();
         try {
-          const image = await deps.image(parsed, abort.signal);
+          const image = await deps.image(parsed, abort.signal, meta);
           deps.log.info(`admin: image ${image.size ?? "?"} ${image.quality ?? "?"} ${image.format}, ${parsed.images?.length ?? 0} reference(s), ${image.data.length} bytes in ${Date.now() - started} ms`);
           res.writeHead(200, {
             "content-type": `image/${image.format}`,
@@ -1954,12 +2617,27 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const provider = query.get("provider") || undefined;
         const session = query.get("session") || undefined;
         const kindValue = query.get("kind");
-        const kind = kindValue === "messages" || kindValue === "count_tokens" || kindValue === "other" ? kindValue : undefined;
-        sendJson(res, 200, { requests: deps.requests.list(n, { ...(provider ? { provider } : {}), ...(kind ? { kind } : {}), ...(session ? { session } : {}) }) });
+        // A comma-separated list so one call can ask for several kinds; unknown entries are ignored
+        // and a list with nothing valid left means no filter.
+        const kinds = kindValue === null ? [] : kindValue.split(",").filter((k): k is "messages" | "count_tokens" | "other" | "image" => k === "messages" || k === "count_tokens" || k === "other" || k === "image");
+        sendJson(res, 200, { requests: deps.requests.list(n, { ...(provider ? { provider } : {}), ...(kinds.length ? { kind: kinds } : {}), ...(session ? { session } : {}) }) });
         return;
       }
       if (pathname === "/api/requests/summary" && method === "GET") {
-        const seconds = Number(new URL(url, "http://x").searchParams.get("since") ?? 3600);
+        const query = new URL(url, "http://x").searchParams;
+        const fromParam = query.get("from");
+        if (fromParam !== null) {
+          const from = Number(fromParam);
+          const toParam = query.get("to");
+          const to = toParam === null ? Date.now() : Number(toParam);
+          if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) {
+            sendJson(res, 400, { error: "from and to must be epoch milliseconds with from <= to" });
+            return;
+          }
+          sendJson(res, 200, { ...deps.requests.usage(from, to), from, to });
+          return;
+        }
+        const seconds = Number(query.get("since") ?? 3600);
         const safeSeconds = Number.isFinite(seconds) ? Math.min(31_536_000, Math.max(0, seconds)) : 3600;
         sendJson(res, 200, deps.requests.summary(Date.now() - safeSeconds * 1000));
         return;
@@ -1978,6 +2656,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       sendJson(res, 404, { error: "not found" });
     } catch (e) {
+      if (e instanceof ModSettingsInputError && !res.headersSent) {
+        sendJson(res, e.status, { error: e.message });
+        return;
+      }
       deps.log.error(`admin error: ${(e as Error).stack ?? e}`);
       if (!res.headersSent) sendJson(res, 500, { error: (e as Error).message });
       else res.destroy();

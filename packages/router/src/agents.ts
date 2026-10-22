@@ -13,9 +13,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { homeDir, type Config, type Provider } from "./config.ts";
+import { adminPort, homeDir, type Config, type Provider } from "./config.ts";
 import { declaredBy } from "./routing.ts";
-import { adminPort } from "./admin.ts";
+import { isJudgeOnlyModel } from "./model-policy.ts";
+import { GROK_EFFORT_LEVELS } from "./providers/grok/catalog.ts";
 import { shortName } from "../../cli/src/hooks/agent-title.ts";
 
 /** The least a caller has to offer as a logger; `console` qualifies, so startup can pass one. */
@@ -40,16 +41,22 @@ const BODY = [
   "너는 이 세션의 실행자다. 위임받은 작업을 직접 끝내고 직접 검증해서 결론만 간결히 보고한다.",
   "파일 전문·코드 덤프는 보고에 넣지 않는다. 추측은 추측이라 명시하고 근거는 파일:줄번호로 댄다.",
   "다른 에이전트에게 넘기지 않는다. 프롬프트 첫 줄의 `[[ripple: …]]` 표식은 라우팅용이니 무시한다.",
-  "**작업 디렉터리(cwd)에 어떤 파일도 만들지 않는다.** 조사·감사처럼 \"읽기만\" 하는 일이어도 마찬가지다.",
-  "임시 파일이 필요하면 `/tmp` 아래에만 만들고, 끝나면 지운다. 사본을 작업 폴더에 떨구지 마라.",
+  "**시키지 않은 파일은 만들지 않는다.** 작업 지시에 결과물 경로가 없으면 조사·감사라도 작업 디렉터리(cwd)에 아무 파일도 남기지 않는다.",
+  "작업 지시가 결과물 경로(파일·폴더)를 정했으면 조사·감사·대조 작업이라도 그 경로에는 반드시 만든다. 그 밖의 메모·사본·임시 파일은 `/tmp` 아래에만 만들고, 끝나면 지운다.",
+  // Claude Code tells a bypass/auto session to read and edit through Bash (since CLI 2.1.234). After it
+  // arrived Bash edits went from 32% to 78% and Read calls from 2,897 to 151 in the operator's
+  // sessions, and details went missing (brain, 2026-08-25); workers here read with `sed -n`/`cat` more
+  // than with Read (2026-10-14). The operator's own rule, given to the workers too:
+  "**소스 파일 읽기와 수정은 전용 도구로 한다.** 처음 만지는 파일은 Read로 통독하고(필요하면 다시 읽는다), 수정은 Edit, 새 파일은 Write로 한다. `cat`·`sed -n`·`head`로 조각만 읽어 넘기지 않고, `sed -i`·heredoc 덮어쓰기·스크립트 재작성으로 소스를 고치지 않는다 — 간격·정렬·주석이 조용히 깎인다. Bash는 검색(grep/rg)·실행·테스트·빌드, 그리고 수십 곳 이상의 기계적 일괄 치환(끝나면 `git diff`로 확인)에만 쓴다.",
 ].join("\n");
 
 /**
  * Added to the body when a ChatGPT provider is configured: how a worker makes an image. A worker has
  * no image tool, and `clauderipple` is not on PATH for everyone (a checkout runs from source), so
- * the instruction is the admin endpoint itself, which curl reaches on every platform.
+ * the instruction is the admin endpoint itself, which curl reaches on every platform. A GPT main
+ * session gets the same lines in its instructions (proxy.ts).
  */
-function imageLine(port: number): string {
+export function imageLine(port: number): string {
   return [
     "이미지가 필요하면 ChatGPT 구독으로 만든다(한 장 30초~수 분):",
     `\`curl -sS --fail-with-body -o <절대경로>.png -H 'content-type: application/json' -d '{"prompt":"…"}' http://127.0.0.1:${port}/api/image\``,
@@ -142,7 +149,7 @@ function scanDir(dir: string, log?: AgentLog): Map<string, AgentEntry> {
 export function agentAliases(dir: string, log?: AgentLog): Record<string, string> {
   const out: Record<string, string> = {};
   for (const entry of scanDir(dir, log).values()) {
-    if (!entry.model) continue;
+    if (!entry.model || isJudgeOnlyModel(entry.model)) continue;
     out[entry.name] = entry.model.replace(/@[a-z]+$/i, "");
   }
   return out;
@@ -154,6 +161,8 @@ export function agentNameFor(modelId: string): string {
 }
 
 function capsEffortLevels(provider: Provider): string[] | undefined {
+  // A grok provider has no caps: its adapter sends the common ladder to a model the listing left out.
+  if (provider.type === "grok") return [...GROK_EFFORT_LEVELS];
   return (provider as { caps?: { effortLevels?: string[] } }).caps?.effortLevels;
 }
 
@@ -205,6 +214,24 @@ function readManifest(file: string): Manifest {
   return { agents: [] };
 }
 
+export type GeneratedAgent = { name: string; model: string; provider: string };
+
+/** Owned files that still exist and name a configured worker, not hand-written agents. */
+export function generatedAgents(cfg: Config, dir = defaultAgentDir(), manifestPath = path.join(homeDir(), "generated-agents.json"), log?: AgentLog): GeneratedAgent[] {
+  const owned = new Set(readManifest(manifestPath).agents);
+  const result: GeneratedAgent[] = [];
+  for (const entry of scanDir(dir, log).values()) {
+    if (!owned.has(entry.name) || !entry.model || isJudgeOnlyModel(entry.model)) continue;
+    const model = entry.model.replace(/@[a-z]+$/i, "");
+    const owners = declaredBy(model, cfg);
+    const provider = owners.length === 1 ? owners[0] : undefined;
+    const target = provider ? cfg.providers[provider] : undefined;
+    if (!provider || !target || (target.type === "anthropic" && !target.accountPool)) continue;
+    result.push({ name: entry.name, model, provider });
+  }
+  return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function writeManifest(file: string, manifest: Manifest, log?: AgentLog): void {
   try {
     fs.writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
@@ -243,6 +270,7 @@ export function syncAgentFiles(cfg: Config, dir: string, log?: AgentLog, opts: S
   for (const [providerName, provider] of Object.entries(cfg.providers)) {
     if (provider.type === "anthropic" && !provider.accountPool) continue;
     for (const model of provider.models ?? []) {
+      if (isJudgeOnlyModel(model.id)) continue;
       const owners = declaredBy(model.id, cfg);
       if (owners.length !== 1) {
         if (owners.length > 1) log?.warn(`agent files: "${model.id}" is declared by ${owners.join(", ")}; not generating an agent for it`);

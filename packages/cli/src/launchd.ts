@@ -14,8 +14,10 @@ export function launchdLabel(): string {
   return process.env.CLAUDERIPPLE_LAUNCHD_LABEL ?? LABEL;
 }
 
+/** Test-only override (CLAUDERIPPLE_LAUNCH_AGENTS_DIR); production always uses ~/Library/LaunchAgents. */
 export function plistPath(): string {
-  return path.join(os.homedir(), "Library", "LaunchAgents", `${launchdLabel()}.plist`);
+  const dir = process.env.CLAUDERIPPLE_LAUNCH_AGENTS_DIR ?? path.join(os.homedir(), "Library", "LaunchAgents");
+  return path.join(dir, `${launchdLabel()}.plist`);
 }
 
 function esc(s: string): string {
@@ -67,50 +69,60 @@ ${environment}
 `;
 }
 
-function launchctl(args: string[]): { ok: boolean; out: string } {
+/** One launchctl invocation. Injectable so recovery tests never reach the real launchd. */
+export type Launchctl = (args: string[]) => { ok: boolean; out: string };
+
+/**
+ * The real launchctl, with a timeout: the menu-bar app runs doctor/repair and must get an answer.
+ * CLAUDERIPPLE_LAUNCHCTL is a test-only override naming a fake binary for end-to-end CLI tests.
+ */
+export const launchctl: Launchctl = (args) => {
   try {
-    const out = execFileSync("launchctl", args, { stdio: ["ignore", "pipe", "pipe"] }).toString();
+    // bootout waits for the router to exit, and a router drains for up to 90s (ExitTimeOut 120):
+    // that one call keeps a budget the drain fits in, so `stop` never reports a drain as a failure.
+    const timeout = args[0] === "bootout" ? 150_000 : 20_000;
+    const out = execFileSync(process.env.CLAUDERIPPLE_LAUNCHCTL ?? "launchctl", args, { stdio: ["ignore", "pipe", "pipe"], timeout }).toString();
     return { ok: true, out };
   } catch (e) {
-    const err = e as { stdout?: Buffer; stderr?: Buffer };
-    return { ok: false, out: `${err.stdout?.toString() ?? ""}${err.stderr?.toString() ?? ""}`.trim() };
+    const err = e as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    return { ok: false, out: `${err.stdout?.toString() ?? ""}${err.stderr?.toString() ?? ""}`.trim() || (err.message ?? "launchctl failed") };
   }
-}
+};
 
 function domain(): string {
   return `gui/${process.getuid?.() ?? 501}`;
 }
 
-export function installAgent(opts: { program: string; args?: string[]; bundleId?: string; home: string; env?: Record<string, string> }): string {
+export function installAgent(opts: { program: string; args?: string[]; bundleId?: string; home: string; env?: Record<string, string> }, run: Launchctl = launchctl): string {
   const file = plistPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const stdoutLog = path.join(opts.home, "logs", "launchd.log");
   fs.mkdirSync(path.dirname(stdoutLog), { recursive: true });
   fs.writeFileSync(file, renderPlist({ ...opts, stdoutLog }));
-  launchctl(["bootout", domain(), file]); // ignore result: may not be loaded
-  const r = launchctl(["bootstrap", domain(), file]);
+  run(["bootout", domain(), file]); // ignore result: may not be loaded
+  const r = run(["bootstrap", domain(), file]);
   if (!r.ok) throw new Error(`launchctl bootstrap failed: ${r.out}`);
   return file;
 }
 
-export function removeAgent(): boolean {
+export function removeAgent(run: Launchctl = launchctl): boolean {
   const file = plistPath();
   if (!fs.existsSync(file)) return false;
-  launchctl(["bootout", domain(), file]);
+  run(["bootout", domain(), file]);
   fs.unlinkSync(file);
   return true;
 }
 
-export function agentState(): "running" | "loaded" | "not-loaded" {
-  const r = launchctl(["print", `${domain()}/${launchdLabel()}`]);
+export function agentState(run: Launchctl = launchctl): "running" | "loaded" | "not-loaded" {
+  const r = run(["print", `${domain()}/${launchdLabel()}`]);
   if (!r.ok) return "not-loaded";
   return /state = running/.test(r.out) ? "running" : "loaded";
 }
 
 /** `force` adds -k, which SIGKILLs a running instance ~5s after SIGTERM. Only restart wants that. */
-export function kickstart(opts: { force?: boolean } = {}): boolean {
+export function kickstart(opts: { force?: boolean } = {}, run: Launchctl = launchctl): boolean {
   const args = ["kickstart", ...(opts.force ? ["-k"] : []), `${domain()}/${launchdLabel()}`];
-  return launchctl(args).ok;
+  return run(args).ok;
 }
 
 /**
@@ -119,16 +131,16 @@ export function kickstart(opts: { force?: boolean } = {}): boolean {
  * up killed it and started the wait over (observed 2026-09-14: three runs in the four minutes
  * after login). Re-bootstraps the plist when the agent was unloaded by `clauderipple stop`.
  */
-export function startAgent(): "already-running" | "started" | "failed" {
-  if (agentState() === "running") return "already-running";
-  if (kickstart()) return "started";
+export function startAgent(run: Launchctl = launchctl): "already-running" | "started" | "failed" {
+  if (agentState(run) === "running") return "already-running";
+  if (kickstart({}, run)) return "started";
   const file = plistPath();
-  if (fs.existsSync(file) && launchctl(["bootstrap", domain(), file]).ok) return "started";
+  if (fs.existsSync(file) && run(["bootstrap", domain(), file]).ok) return "started";
   return "failed";
 }
 
-export function agentPid(): number | null {
-  const r = launchctl(["print", `${domain()}/${launchdLabel()}`]);
+export function agentPid(run: Launchctl = launchctl): number | null {
+  const r = run(["print", `${domain()}/${launchdLabel()}`]);
   if (!r.ok) return null;
   const m = /^\s*pid = (\d+)/m.exec(r.out);
   return m ? Number(m[1]) : null;

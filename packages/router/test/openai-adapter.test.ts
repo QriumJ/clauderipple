@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import { mapHttpError, OpenAiCompatibleAdapter } from "../src/providers/openai/index.ts";
 import { Logger } from "../src/log.ts";
+import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 
 const seen: { path: string; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
-let mode: "chat" | "responses" | "error" | "cut-responses" | "cut-chat" | "done-chat" = "chat";
+let mode: "chat" | "responses" | "error" | "cut-responses" | "cut-chat" | "done-chat" | "refuse-reasoning" | "refuse-chat" | "sealed" | "sealed-chat" = "chat";
 const sse = (records: Record<string, unknown>[]) => records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join("");
 
 const upstream = http.createServer((req, res) => {
@@ -16,6 +18,39 @@ const upstream = http.createServer((req, res) => {
     seen.push({ path: req.url ?? "", headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> });
     if (mode === "error") {
       res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "missing key" } }));
+      return;
+    }
+    // A vendor that refuses the reasoning carried back in the request it was given.
+    if (mode === "refuse-reasoning" || mode === "refuse-chat") {
+      const body = seen.at(-1)!.body as { input?: unknown[]; messages?: unknown[] };
+      const carried = mode === "refuse-chat" ? JSON.stringify(body.messages ?? []) : JSON.stringify(body);
+      if (carried.includes(mode === "refuse-chat" ? '"reasoning_content"' : "encrypted_content")) {
+        res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: mode === "refuse-chat" ? "Invalid request: `reasoning_content` was not produced by this model" : "Invalid value for 'input[3].encrypted_content': the item was not produced by this model" } }));
+        return;
+      }
+    }
+    // A Chat vendor that streams its reasoning beside the answer and takes tool calls (DeepSeek).
+    if (mode === "sealed-chat") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(sse([
+        { choices: [{ delta: { reasoning_content: "let me look" }, finish_reason: null }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "Read", arguments: '{"file_path":"a.ts"}' } }] }, finish_reason: "tool_calls" }] },
+        { choices: [], usage: { prompt_tokens: 40, completion_tokens: 5 } },
+      ]));
+      return;
+    }
+    // A Responses deployment that seals its reasoning into the completed item.
+    if (mode === "sealed") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(sse([
+        { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" }, output_index: 0 },
+        { type: "response.reasoning_summary_text.delta", delta: "thinking…", item_id: "rs_1" },
+        { type: "response.output_item.done", item: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" } },
+        { type: "response.output_item.added", item: { type: "function_call", call_id: "call_1", id: "fc_1", name: "Read" }, output_index: 1 },
+        { type: "response.function_call_arguments.delta", delta: '{"file_path":"a.ts"}', item_id: "fc_1" },
+        { type: "response.output_item.done", item: { type: "function_call", id: "fc_1" } },
+        { type: "response.completed", response: { usage: { input_tokens: 40, output_tokens: 5 } } },
+      ]));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -32,7 +67,7 @@ const upstream = http.createServer((req, res) => {
       res.end(`${sse([{ choices: [{ delta: { content: "Hi" }, finish_reason: null }] }])}data: [DONE]\n\n`);
       return;
     }
-    const records = mode === "chat"
+    const records = mode === "chat" || mode === "refuse-chat"
       ? [
           { choices: [{ delta: { content: "Hi" }, finish_reason: null }] },
           { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "Read", arguments: '{"path":"a"}' } }] }, finish_reason: "tool_calls" }] },
@@ -228,6 +263,117 @@ test("a cut-off non-streaming turn is answered 529, not 200 with the fragment", 
   assert.equal(JSON.parse(response.text).error.type, "overloaded_error");
 });
 
+// ---- reasoning replay through the whole adapter (reasoning.ts) ----------------------------------
+
+// The adapter hands the client a carrier block for the reasoning the backend sealed, and the very
+// block comes back on the next turn — so it is put back exactly where the CLI replays it, with
+// `include` asking for the reasoning to keep being sealed. One round trip proves the loop closes.
+test("a sealed reasoning item is carried to the client and replayed on the next turn", async () => {
+  mode = "sealed";
+  adapter = new OpenAiCompatibleAdapter("opencode-go", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "responses" }, log);
+  const first = await call({ ...request, stream: false });
+  assert.equal(first.status, 200);
+  assert.equal(seen.at(-1)?.body.include, undefined, "nothing to carry yet, so nothing is asked for");
+  const message = JSON.parse(first.text) as { content: { type: string; thinking?: string; signature?: string }[] };
+  const carried = message.content.find((b) => b.type === "thinking")!;
+  assert.equal(carried.thinking, "thinking…");
+  assert.deepEqual(decodeEnvelope(carried.signature), {
+    w: "responses",
+    p: "opencode-go",
+    m: "vendor-model",
+    r: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" },
+  });
+
+  // The next turn carries the block exactly as the client got it, in front of the call it belongs to.
+  const second = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(second.status, 200);
+  const replayed = seen.at(-1)!.body as { include?: unknown; input: unknown[] };
+  assert.deepEqual(replayed.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(replayed.input[1], { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" });
+  assert.deepEqual(replayed.input[2], { type: "function_call", call_id: "call_1", name: "Read", arguments: '{"file_path":"a.ts"}' });
+});
+
+// A vendor that refuses the reasoning carried back gets one more ask without it. The turn is the
+// user's and must not fail over an optimisation the router chose to make (reasoning.ts).
+test("a refusal naming the replayed reasoning is retried once without it", async () => {
+  mode = "refuse-reasoning";
+  adapter = new OpenAiCompatibleAdapter("opencode-go", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "responses" }, log);
+  const carried = { type: "thinking", thinking: "", signature: encodeEnvelope({ w: "responses", p: "opencode-go", m: "vendor-model", r: { type: "reasoning", encrypted_content: "gAAAAsealed" } }) };
+  const response = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(response.status, 200, "the retry answered, the refusal did not reach the user");
+  const attempts = seen.slice(-2).map((s) => JSON.stringify(s.body).includes("encrypted_content"));
+  assert.deepEqual(attempts, [true, false], "the second ask carried no reasoning");
+});
+
+// The Chat wire carries no sealed blob to hand back, so the block's own text is what returns, under
+// the field name the vendor used. DeepSeek's own docs make this mandatory while tools are present:
+// a turn that omits a previous turn's `reasoning_content` is answered 400.
+test("a Chat reasoning turn is carried to the client and replayed as reasoning_content", async () => {
+  mode = "sealed-chat";
+  adapter = new OpenAiCompatibleAdapter("opencode-zen", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "chat" }, log);
+  const first = await call({ ...request, stream: false });
+  assert.equal(first.status, 200);
+  const message = JSON.parse(first.text) as { content: { type: string; thinking?: string; signature?: string }[] };
+  const carried = message.content.find((b) => b.type === "thinking")!;
+  assert.equal(carried.thinking, "let me look");
+  assert.deepEqual(decodeEnvelope(carried.signature), { w: "chat", p: "opencode-zen", m: "vendor-model", f: "reasoning_content" });
+
+  const plain = await call({ ...request, stream: false, messages: [{ role: "user", content: "read a" }] });
+  assert.equal(plain.status, 200);
+  assert.equal((seen.at(-1)!.body.messages as { reasoning_content?: string }[]).some((m) => m.reasoning_content !== undefined), false, "nothing to replay, so no message carries it");
+
+  const second = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(second.status, 200);
+  const messages = (seen.at(-1)!.body as { messages: { role: string; reasoning_content?: string; tool_calls?: unknown[] }[] }).messages;
+  const assistant = messages.find((m) => m.role === "assistant")!;
+  assert.equal(assistant.reasoning_content, "let me look");
+  assert.deepEqual(assistant.tool_calls, [{ id: "call_1", type: "function", function: { name: "Read", arguments: '{"file_path":"a.ts"}' } }]);
+});
+
+// The same one-more-ask applies: a Chat vendor that refuses `reasoning_content` from another account
+// must not fail the user's turn over it (reasoning.ts).
+test("a Chat vendor's refusal of reasoning_content is retried once without it", async () => {
+  mode = "refuse-chat";
+  adapter = new OpenAiCompatibleAdapter("opencode-zen", { type: "openai-compatible", url: `http://127.0.0.1:${upstreamPort}/v1`, wire: "chat" }, log);
+  const carried = { type: "thinking", thinking: "deepseek thought", signature: encodeEnvelope({ w: "chat", p: "opencode-zen", m: "vendor-model", f: "reasoning_content" }) };
+  const response = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(response.status, 200, "the retry answered, the refusal did not reach the user");
+  const attempts = seen.slice(-2).map((s) => JSON.stringify((s.body as { messages?: unknown }).messages ?? []).includes('"reasoning_content"'));
+  assert.deepEqual(attempts, [true, false], "the second ask carried no reasoning");
+});
+
 test("cleanup", () => {
   front.close();
   upstream.close();
@@ -249,3 +395,35 @@ test("a 403 that is not about the credential is a permission error, not an auth 
 
   assert.equal(mapHttpError(401, "{}").status, 401);
 });
+
+// fetch refuses a header value it cannot send and quotes it whole — credential included — in the
+// error, which reaches the retry log, the client and (rethrown) the request log.
+test("a credential quoted in a connection error is redacted in the retry log, the client error and the rethrown error", async () => {
+  const lines: string[] = [];
+  const capture = { info: (line: string) => lines.push(line), warn: (line: string) => lines.push(line), error: (line: string) => lines.push(line) } as unknown as Logger;
+  const bad = new OpenAiCompatibleAdapter("bad", { type: "openai-compatible", url: "http://127.0.0.1:9/v1", wire: "chat" }, capture, {
+    headers: async () => ({ authorization: "Bearer sec\u0000ret-token-1234" }),
+    attempts: 2,
+  });
+  // A response stand-in: nothing here needs a socket.
+  let text = "";
+  const res = Object.assign(new EventEmitter(), {
+    headersSent: false,
+    writeHead() { this.headersSent = true; return this; },
+    end(body?: string) { text += body ?? ""; return this; },
+  }) as unknown as http.ServerResponse;
+  let thrown: Error | undefined;
+  await bad.handle({} as http.IncomingMessage, res, "/v1/messages", { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] } as AnthropicRequest, "m", undefined)
+    .catch((error: Error) => { thrown = error; });
+  assert.match(text, /unreachable/);
+  assert.ok(lines.some((line) => /could not connect/.test(line)), "the retry was logged");
+  assert.ok(thrown, "the error still reaches the caller");
+  for (const out of [text, ...lines, thrown!.message]) assert.doesNotMatch(out, /ret-token-1234/);
+});
+
+test("a credential escaped inside a JSON error body is redacted once the body is decoded", () => {
+  const body = JSON.stringify({ error: { message: "bad key PLACEHOLDER" } }).replace("PLACEHOLDER", "\\u0073ecret-xyz");
+  assert.match(mapHttpError(401, body).body, /secret-xyz/, "decoded, the escape spells the credential");
+  assert.doesNotMatch(mapHttpError(401, body, "P", undefined, (m) => m.replaceAll("secret-xyz", "[REDACTED]")).body, /secret-xyz/);
+});
+

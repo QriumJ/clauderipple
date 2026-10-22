@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isJudgeOnlyModel } from "../../router/src/model-policy.ts";
 
 const START = "# >>> ClaudeRipple Codex provider >>>";
 const END = "# <<< ClaudeRipple Codex provider <<<";
@@ -85,7 +86,8 @@ export function writeCodexCatalog(models: CatalogModel[], home = codexHome()): s
   } catch {
     return undefined;
   }
-  const entries = (cached.models ?? []).filter((m) => typeof m.slug === "string");
+  models = models.filter(m => !isJudgeOnlyModel(m.id));
+  const entries = (cached.models ?? []).filter((m) => typeof m.slug === "string" && !isJudgeOnlyModel(m.slug));
   const template = entries.find((m) => m.slug === "gpt-5.5" && m.model_messages) ?? entries.find((m) => m.model_messages);
   if (!template) return undefined;
   const ours = models.map((m, i) => ({

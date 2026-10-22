@@ -7,6 +7,6 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["packages/cli/src/**/*.ts", "packages/router/src/**/*.ts"],
+  "include": ["packages/cli/src/**/*.ts", "packages/router/src/**/*.ts", "packages/remote/src/**/*.ts"],
   "exclude": ["packages/app/**", "packages/*/test/**", "node_modules"]
 }

@@ -1,0 +1,28 @@
+# Ripple relay (packages/remote/relay). Forwards end-to-end encrypted frames between a phone and
+# its host, one Durable Object per host, and serves the PWA. Build the PWA first (build-web.ts),
+# which `npm run relay:dev` / `npm run relay:deploy` at the repo root do.
+name = "ripple-relay"
+main = "worker.ts"
+compatibility_date = "2026-09-20"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# Only the sockets run the worker. The PWA is plain static assets — free and unlimited on Cloudflare
+# (developers.cloudflare.com/workers/static-assets/billing-and-limitations, 2026-04-23) — with
+# their headers from dist/_headers.
+run_worker_first = ["/ws/*"]
+html_handling = "auto-trailing-slash"
+not_found_handling = "none"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "RelayRoom"
+
+# SQLite-backed: the class kind the Workers Free plan allows.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
+
+[observability]
+enabled = false

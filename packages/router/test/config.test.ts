@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, DEFAULTS, providerFor, validate } from "../src/config.ts";
-import type { AnthropicCompatibleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, fastSwitches, providerFor, validate } from "../src/config.ts";
+import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 
 test("validate rejects an unusable Auto mode classifier target", () => {
@@ -13,6 +13,19 @@ test("validate rejects an unusable Auto mode classifier target", () => {
   assert.ok(validate({ ...DEFAULTS, providers, autoModeClassifier: { provider: "missing", model: "gpt-6-luna" } }).some((e) => e.includes("unknown provider")));
   assert.ok(validate({ ...DEFAULTS, providers, autoModeClassifier: { provider: "p", model: "" } }).some((e) => e.includes("missing model")));
   assert.ok(validate({ ...DEFAULTS, providers: { p: { type: "anthropic", auth: "claude-code" } }, autoModeClassifier: { provider: "p", model: "claude-sonnet-5" } }).some((e) => e.includes("ingress-only")));
+});
+
+test("validate accepts a web search backend and rejects an unusable one", () => {
+  const providers = { p: { type: "chatgpt" as const } };
+  assert.deepEqual(validate({ ...DEFAULTS, providers, webSearch: { provider: "p", model: "gpt-5.6-terra" } }), []);
+  assert.deepEqual(validate({ ...DEFAULTS, providers, webSearch: { provider: "p", model: "gpt-5.6-terra", maxResults: 3 } }), []);
+  const bad = (webSearch: unknown) => validate({ ...DEFAULTS, providers, webSearch: webSearch as NonNullable<Config["webSearch"]> }).join();
+  assert.match(bad({ provider: "missing", model: "m" }), /unknown provider/);
+  assert.match(bad({ provider: "", model: "m" }), /missing provider/);
+  assert.match(bad({ provider: "p", model: " " }), /missing model/);
+  assert.match(bad({ provider: "p", model: "m", maxResults: 0 }), /maxResults must be a positive integer/);
+  assert.match(bad({ provider: "p", model: "m", maxResults: 2.5 }), /maxResults must be a positive integer/);
+  assert.match(bad("p"), /webSearch must be an object/);
 });
 
 test("validate reports unknown providers and bad urls", () => {
@@ -43,6 +56,27 @@ test("validate accepts native Anthropic providers and confines account pools to 
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "bad" as "api-key" } } }).some((error) => error.includes("auth must be")));
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "api-key", accountPool: true } } }).some((error) => error.includes('requires auth "claude-code"')));
   assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "claude-code", accountPool: "yes" as unknown as boolean } } }).some((error) => error.includes("must be true or false")));
+  // `limits` is carried by every provider kind, so a wrong type is refused once for all of them.
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { ok: { type: "anthropic", auth: "claude-code", limits: false } } }), []);
+  assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "anthropic", auth: "claude-code", limits: "no" as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
+  assert.ok(validate({ ...DEFAULTS, providers: { bad: { type: "chatgpt", limits: 1 as unknown as boolean } } }).some((error) => error.includes("limits must be true or false")));
+});
+
+test("validate accepts a chatgpt provider's Fast switches and refuses a fast that is not an object", () => {
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: { main: true, subagent: false } } } }), []);
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: {} } } }), []);
+  assert.ok(validate({ ...DEFAULTS, providers: { gpt: { type: "chatgpt", fast: "yes" as unknown as { main: boolean } } } }).some((error) => error.includes("fast must be an object")));
+});
+
+test("a Fast switch that is not a boolean reads as off", () => {
+  assert.deepEqual(fastSwitches({ fast: { main: true, subagent: true } }), { main: true, subagent: true });
+  assert.deepEqual(fastSwitches({ fast: { main: false } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: {} }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches(undefined), { main: false, subagent: false });
+  // A hand-edited file can hold anything: a value that is not `true` is off, never "on".
+  assert.deepEqual(fastSwitches({ fast: { main: "yes" as unknown as boolean, subagent: 1 as unknown as boolean } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: null as unknown as { main: boolean } }), { main: false, subagent: false });
+  assert.deepEqual(fastSwitches({ fast: "yes" as unknown as { main: boolean } }), { main: false, subagent: false });
 });
 
 test("validate accepts compatible caps and rejects invalid values", () => {
@@ -154,6 +188,66 @@ test("the three providers one OpenCode Go account needed are read as one", () =>
   assert.deepEqual(native.headers, { "x-api-key": "sk-test" }, "one copy of the key, under the convention this wire wants");
 });
 
+// A model on Google's own wire needs the google adapter, which is an ordinary `google` provider.
+// The key lives in the provider's headers (one copy to rotate) and moves to `apiKey` on this wire,
+// whose credential header is `x-goog-api-key`; every other vendor header travels along.
+test("a google-wire model folds into a google api-key provider, key taken from the provider's headers", () => {
+  const provider: OpenAiCompatibleProvider = {
+    type: "openai-compatible",
+    url: "https://opencode.ai/zen/go/v1",
+    preset: "opencode-go",
+    sessionHeader: "x-opencode-session",
+    headers: { authorization: "Bearer sk-test", "x-extra": "kept" },
+    identity: false,
+    instructionsAppend: "be brief",
+    limits: true,
+    models: [
+      { id: "gemini-4-argon-contributor", wire: "google", url: "https://opencode.ai/inference/go/google" },
+      { id: "gpt-5.6-luna" },
+    ],
+  };
+  const folded = providerFor(provider, "gemini-4-argon-contributor") as GoogleProvider;
+  assert.equal(folded.type, "google");
+  assert.equal(folded.auth, "api-key");
+  assert.equal(folded.apiKey, "sk-test");
+  assert.equal(folded.url, "https://opencode.ai/inference/go/google");
+  assert.equal(folded.sessionHeader, "x-opencode-session");
+  assert.deepEqual(folded.headers, { "x-extra": "kept" }, "the key is not restated in the provider headers");
+  assert.equal(folded.identity, false);
+  assert.equal(folded.instructionsAppend, "be brief");
+  assert.equal(folded.limits, true);
+  assert.equal(folded.preset, "opencode-go");
+  assert.equal(folded.models, provider.models);
+
+  // The other convention in use is recognised too.
+  const xKey = providerFor({ ...provider, headers: { "x-api-key": "sk-x", "x-extra": "kept" } }, "gemini-4-argon-contributor") as GoogleProvider;
+  assert.equal(xKey.apiKey, "sk-x");
+  assert.equal(providerFor(provider, "gpt-5.6-luna"), provider, "a model with no override is still the provider itself");
+});
+
+test("validate accepts a google-wire model and a google provider's sessionHeader/headers", () => {
+  assert.deepEqual(validate({
+    ...DEFAULTS,
+    providers: {
+      go: {
+        type: "openai-compatible", url: "https://opencode.ai/zen/go/v1", sessionHeader: "x-opencode-session",
+        headers: { authorization: "Bearer k" },
+        models: [{ id: "gemini-4-argon-contributor", wire: "google", url: "https://opencode.ai/inference/go/google" }],
+      },
+      gem: { type: "google", auth: "api-key", apiKey: "g", url: "https://opencode.ai/inference/go/google", sessionHeader: "x-opencode-session", headers: { "x-extra": "y" } },
+    },
+  }), []);
+  const bad = validate({
+    ...DEFAULTS,
+    providers: {
+      gem: { type: "google", auth: "api-key", headers: { "x-extra": 1 as unknown as string } },
+      go: { type: "openai-compatible", url: "https://example.test", models: [{ id: "m", wire: "gemini" as "google" }] },
+    },
+  });
+  assert.ok(bad.some((error) => error.includes("headers must be a string record")));
+  assert.ok(bad.some((error) => error.includes("wire (\"chat\"")), "an unknown wire is refused by the models shape");
+});
+
 test("one OpenCode Go provider on its own is not a split, and is left alone", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-fold-one-"));
   const file = path.join(dir, "config.json");
@@ -217,4 +311,21 @@ test("validate refuses a credential pool with duplicate ids or non-string header
   assert.ok(cfg([{ headers: {} }])[0]?.includes("non-empty id"));
   assert.ok(cfg([{ id: "a", headers: { key: 5 } }])[0]?.includes("string record"));
   assert.ok(cfg([{ id: "a", headers: {}, label: 7 }])[0]?.includes("label must be a string"));
+});
+
+test("validate accepts a grok provider and refuses a model that would leave its session headers behind", () => {
+  const ok = validate({ ...DEFAULTS, providers: { grok: { type: "grok", models: [{ id: "grok-4.7", name: "Grok 4.7", contextWindow: 256000, effortLevels: ["low", "high"] }] } } });
+  assert.deepEqual(ok, []);
+  assert.deepEqual(validate({ ...DEFAULTS, providers: { grok: { type: "grok", home: "/tmp/g", cli: "/tmp/g/bin/grok", clientVersion: "1.0.46", url: "https://cli-chat-proxy.grok.com/v1" } } }), []);
+  const rewired = validate({ ...DEFAULTS, providers: { grok: { type: "grok", models: [{ id: "grok-4.7", wire: "responses" }] } } });
+  assert.ok(rewired.some((e) => e.includes("cannot set wire, url or authHeader")));
+  assert.ok(validate({ ...DEFAULTS, providers: { grok: { type: "grok", url: "cli-chat-proxy.grok.com" } } }).some((e) => e.includes("url must start")));
+  assert.ok(validate({ ...DEFAULTS, providers: { grok: { type: "grok", home: "" } } }).some((e) => e.includes("home must be a non-empty string")));
+  // clientVersion goes out as a header value.
+  assert.ok(validate({ ...DEFAULTS, providers: { grok: { type: "grok", clientVersion: "1.0.46\nx-evil: 1" } } }).some((e) => e.includes("clientVersion cannot be sent as a header")));
+  assert.ok(validate({ ...DEFAULTS, providers: { grok: { type: "grok", clientVersion: "버전1" } } }).some((e) => e.includes("clientVersion cannot be sent as a header")));
+  assert.ok(validate({ ...DEFAULTS, providers: { grok: { type: "grok", clientVersion: "1.0.46\u0000" } } }).some((e) => e.includes("clientVersion cannot be sent as a header")));
+  // A grok model with no overrides is its own provider: providerFor hands it back unchanged.
+  const provider = { type: "grok" as const, models: [{ id: "grok-4.7" }] };
+  assert.equal(providerFor(provider, "grok-4.7"), provider);
 });

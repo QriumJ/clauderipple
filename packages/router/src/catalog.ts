@@ -5,13 +5,15 @@
 // model, one after another. With upstream latency swinging from 0.5s to 25s on identical one-token
 // requests (glm-5.3-flash, measured 2026-10-02), three models took 2m33s.
 //
-// models.dev (https://models.dev/api.json, maintained by the team behind OpenCode) states both for
-// every model OpenCode serves: `reasoning_options` lists the effort values, and `provider.npm` names
-// the SDK the OpenCode client speaks to it with. It is also more accurate than asking: a 200 only
-// says a level was not refused, and glm-5.3-flash answered 200 to seven levels where the catalogue
-// lists `low`/`high`/`max` — the rest were accepted and, as far as anything can tell, ignored. And
-// muse-spark-1.3-contributor names `max` in its own error message, refuses it when sent, and the
-// catalogue never lists it.
+// models.dev (https://models.dev/api.json, maintained by the team behind OpenCode) states three
+// things for every model OpenCode serves: `reasoning_options` lists the effort values, `provider.npm`
+// names the SDK the OpenCode client speaks to it with, and `limit.context` is the model's context
+// window — which OpenCode's own `/models` does not report at all. It is also more accurate than
+// asking on effort: a 200 only says a level was not refused, and glm-5.3-flash answered 200 to seven
+// levels where the catalogue lists `low`/`high`/`max` — the rest were accepted and, as far as
+// anything can tell, ignored. And muse-spark-1.3-contributor's catalogue entry omits `max` even
+// though the live model takes it: measured 2026-10-14, `reasoning.effort: "max"` was answered 200
+// with effort echoed "max" and 253 reasoning tokens against 134 at xhigh.
 //
 // The catalogue is community-maintained and a new model can arrive a day late; a model it does not
 // list is measured exactly as before.
@@ -35,9 +37,12 @@ export type CatalogEntry = {
   /** The effort values the model takes; empty when it takes none (a toggle or a token budget is not
    * an effort). Absent when the entry does not say, which leaves the ladder to measurement. */
   effortLevels?: string[];
+  /** The model's context window, from `limit.context`. Absent when the entry does not state one that
+   * could be a window, which leaves it to the global fallback. */
+  contextWindow?: number;
 };
 
-type CatalogModel = { provider?: { npm?: unknown }; reasoning?: unknown; reasoning_options?: unknown };
+type CatalogModel = { provider?: { npm?: unknown }; reasoning?: unknown; reasoning_options?: unknown; limit?: { context?: unknown } };
 type CatalogProvider = { npm?: unknown; models?: Record<string, CatalogModel> };
 
 /** The SDK packages that map onto a wire this router sends. Any other (`@ai-sdk/google`, …) says
@@ -65,7 +70,15 @@ export function catalogEntry(catalog: unknown, preset: string | undefined, model
   } else if (model.reasoning === false) {
     effortLevels = [];
   }
-  return { ...(wire ? { wire } : {}), ...(effortLevels ? { effortLevels } : {}) };
+  // The catalogue's own window, which OpenCode's `/models` does not carry. A fractional or
+  // non-positive `context` is not a window we would hand Claude Code, so it is left unstated.
+  const context = model.limit?.context;
+  const contextWindow = typeof context === "number" && Number.isInteger(context) && context > 0 ? context : undefined;
+  return {
+    ...(wire ? { wire } : {}),
+    ...(effortLevels ? { effortLevels } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
 }
 
 let cached: { at: number; catalog: unknown } | undefined;

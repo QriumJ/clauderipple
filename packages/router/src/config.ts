@@ -8,6 +8,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CompatibleCaps } from "./compat.ts";
+import { PRESETS } from "./presets.ts";
+import { hostProblem, portProblem } from "./remote-host.ts";
 
 export type ProviderModel = {
   id: string;
@@ -25,7 +27,7 @@ export type ProviderModel = {
    * account had to be configured as three providers — a split the user saw, did not ask for, and
    * had to repeat in every `direct` rule. It belongs to the model, which is what actually varies.
    */
-  wire?: "chat" | "responses" | "anthropic";
+  wire?: "chat" | "responses" | "anthropic" | "google";
   /** This model's endpoint base, when its wire is served on another path than the provider's. */
   url?: string;
   /**
@@ -80,6 +82,8 @@ export type AnthropicCompatibleProvider = {
   identity?: boolean;
   /** Fixed text appended to the system prompt. Must stay constant across turns or the prompt cache breaks. */
   instructionsAppend?: string;
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
   /** Compatibility overrides. Unspecified fields fall back to the preset, then strict defaults. */
   caps?: CompatibleCaps;
 };
@@ -95,10 +99,19 @@ export type ChatGptProvider = {
   identity?: boolean;
   /** Fixed text appended to the system prompt. Must stay constant across turns or the prompt cache breaks. */
   instructionsAppend?: string;
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
   /** Troubleshooting: true = dump failed upstream exchanges to <home>/debug/; "all" = dump every exchange (last 60). */
   debugDump?: boolean | "all";
   /** Reasoning effort when the request carries none. Default "high". */
   defaultEffort?: string;
+  /**
+   * The Fast (Codex priority tier) switches. Claude Code never asks for `speed: "fast"` on a GPT
+   * request — its own client gate — so the tier is chosen here instead: `main` for the session's
+   * own turns, `subagent` for the turns a subagent makes. Both off by default: the fast tier bills
+   * the plan faster.
+   */
+  fast?: { main?: boolean; subagent?: boolean };
   /** Models offered in the GUI (the Codex backend has no listing endpoint). */
   models?: ProviderModel[];
 };
@@ -126,6 +139,8 @@ export type OpenAiCompatibleProvider = {
   identity?: boolean;
   /** Fixed text appended to the system prompt. Must stay constant across turns or the prompt cache breaks. */
   instructionsAppend?: string;
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
   /** Reasoning-effort capability exposed by this API/model family. */
   caps?: { effortLevels?: string[]; reasoning?: "effort" | "none" };
 };
@@ -145,12 +160,24 @@ export type GoogleProvider = {
   apiKey?: string;
   /** Override the API base (default https://generativelanguage.googleapis.com). */
   url?: string;
+  /**
+   * A header this vendor recognises a conversation by, filled with a value that is stable for one
+   * conversation and different between two. OpenCode Go's Gemini endpoint refuses a request without
+   * `x-opencode-session` outright (400 MissingSessionID). Absent, nothing extra is sent.
+   */
+  sessionHeader?: string;
+  /** Optional vendor headers to set on forwarded requests (never logged). The auth header is still `x-goog-api-key`. */
+  headers?: Record<string, string>;
+  /** Catalog preset used to populate this provider, if any (carried when a model folded into it). */
+  preset?: string;
   /** Models offered in the GUI (the probe fills this from `GET /v1beta/models`). */
   models?: ProviderModel[];
   /** Prefix the system prompt with a one-line identity so the model knows what it is. Default true. */
   identity?: boolean;
   /** Fixed text appended to the system prompt. Must stay constant across turns or the prompt cache breaks. */
   instructionsAppend?: string;
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
   /** Reasoning effort when the request carries none. */
   defaultEffort?: string;
 };
@@ -168,9 +195,68 @@ export type AnthropicProvider = {
    */
   accountPool?: boolean;
   models?: ProviderModel[];
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
 };
 
-export type Provider = AnthropicCompatibleProvider | ChatGptProvider | OpenAiCompatibleProvider | GoogleProvider | AnthropicProvider;
+export type GrokProvider = {
+  /**
+   * Grok on a SuperGrok / X Premium subscription, through the chat proxy the Grok CLI itself uses
+   * (Anthropic Messages translated to Chat Completions). Signs in with the CLI's own session
+   * (`grok login`, `<home>/auth.json`), read-only; when it runs low the CLI is asked to refresh it.
+   * The channel and its headers are the CLI's, not a public API (ARCHITECTURE §4e).
+   */
+  type: "grok";
+  /** The Grok CLI home holding auth.json. Default $GROK_HOME, else ~/.grok. */
+  home?: string;
+  /** The `grok` binary that refreshes the session and reports its version. Default: <home>/bin/grok, then PATH, then ~/.local/bin/grok. */
+  cli?: string;
+  /** Override the proxy base (default https://cli-chat-proxy.grok.com/v1). */
+  url?: string;
+  /** Sent as `x-grok-client-version` instead of what `grok --version` prints. */
+  clientVersion?: string;
+  /** Models offered in the GUI (the probe fills this from the proxy's `/v1/models`). */
+  models?: ProviderModel[];
+  /** Prefix the system prompt with a one-line identity so the model knows what it is. Default true. */
+  identity?: boolean;
+  /** Fixed text appended to the system prompt. Must stay constant across turns or the prompt cache breaks. */
+  instructionsAppend?: string;
+  /** Show this provider's quota in the status bar's limits row. Default true (ignored when unreadable). */
+  limits?: boolean;
+};
+
+export type Provider = AnthropicCompatibleProvider | ChatGptProvider | OpenAiCompatibleProvider | GoogleProvider | AnthropicProvider | GrokProvider;
+
+/**
+ * A provider's Fast switches as two plain booleans.
+ *
+ * Anything that is not exactly `true` is off: the switches are read from a file a person can edit
+ * by hand, and a value that is not a boolean ("yes", 1, null) must not be read as "on". A `fast`
+ * that is not an object at all is off the same way, rather than a crash on the first request.
+ */
+export function fastSwitches(provider: { fast?: { main?: unknown; subagent?: unknown } } | undefined): { main: boolean; subagent: boolean } {
+  const fast = provider?.fast;
+  if (!fast || typeof fast !== "object") return { main: false, subagent: false };
+  return { main: fast.main === true, subagent: fast.subagent === true };
+}
+
+/**
+ * The provider's own key wherever its headers carry it, and every header that is not that one.
+ *
+ * Both auth conventions in use are recognised (`x-api-key` and `Authorization: Bearer`), because
+ * one account's headers may describe either depending on the endpoint it was configured for.
+ */
+function credentialIn(headers: Record<string, string>): { key?: string; kept: Record<string, string> } {
+  const kept: Record<string, string> = {};
+  let key: string | undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (lower === "x-api-key") { key ??= value; continue; }
+    if (lower === "authorization") { key ??= value.replace(/^Bearer\s+/i, ""); continue; }
+    kept[name] = value;
+  }
+  return key === undefined ? { kept } : { key, kept };
+}
 
 /**
  * The provider's own key, re-sent under the header another wire on the same account expects.
@@ -181,14 +267,7 @@ export type Provider = AnthropicCompatibleProvider | ChatGptProvider | OpenAiCom
  */
 function reauthorized(headers: Record<string, string> | undefined, kind: "x-api-key" | "authorization-bearer"): Record<string, string> | undefined {
   if (!headers) return headers;
-  const kept: Record<string, string> = {};
-  let key: string | undefined;
-  for (const [name, value] of Object.entries(headers)) {
-    const lower = name.toLowerCase();
-    if (lower === "x-api-key") { key ??= value; continue; }
-    if (lower === "authorization") { key ??= value.replace(/^Bearer\s+/i, ""); continue; }
-    kept[name] = value;
-  }
+  const { key, kept } = credentialIn(headers);
   // Nothing recognisable to move: leave the headers exactly as they were rather than inventing an
   // empty credential, which would read to the endpoint as a missing key instead of a config error.
   if (key === undefined) return headers;
@@ -214,6 +293,30 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
   if (!entry || (entry.wire === undefined && entry.url === undefined && entry.authHeader === undefined)) return provider;
 
   const url = entry.url ?? ("url" in provider ? provider.url : undefined);
+
+  // A Gemini endpoint on the same key and the same provider. The Google adapter is an ordinary
+  // `google` provider now, so the model is folded into one here rather than growing a fourth
+  // adapter: the key moves from the provider's headers to `apiKey` (its convention on this wire is
+  // `x-goog-api-key`, never a bearer), and every header that is not the auth one travels along.
+  if (entry.wire === "google") {
+    const { key, kept } = credentialIn("headers" in provider && provider.headers ? provider.headers : {});
+    const apiKey = "apiKey" in provider && typeof provider.apiKey === "string" ? provider.apiKey : key;
+    const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
+    return {
+      type: "google",
+      auth: "api-key",
+      ...(apiKey !== undefined ? { apiKey } : {}),
+      url: url ?? "",
+      ...(sessionHeader ? { sessionHeader } : {}),
+      ...(Object.keys(kept).length > 0 ? { headers: kept } : {}),
+      ...("models" in provider && provider.models ? { models: provider.models } : {}),
+      ...("identity" in provider && provider.identity !== undefined ? { identity: provider.identity } : {}),
+      ...("instructionsAppend" in provider && provider.instructionsAppend ? { instructionsAppend: provider.instructionsAppend } : {}),
+      ...("limits" in provider && provider.limits !== undefined ? { limits: provider.limits } : {}),
+      ...("preset" in provider && provider.preset ? { preset: provider.preset } : {}),
+    };
+  }
+
   const headers = entry.authHeader
     ? reauthorized("headers" in provider ? provider.headers : undefined, entry.authHeader)
     : ("headers" in provider ? provider.headers : undefined);
@@ -232,6 +335,28 @@ export function providerFor(provider: Provider, model: string | undefined): Prov
     return { ...rest, type: "anthropic-compatible", url: url ?? "", caps: { effortLevels: entry.effortLevels ?? [] } } as AnthropicCompatibleProvider;
   }
   return { ...shared, type: "openai-compatible", url: url ?? "", ...(entry.wire ? { wire: entry.wire } : {}) } as OpenAiCompatibleProvider;
+}
+
+/**
+ * The Anthropic endpoint a web search for `model` runs on, when the provider's preset measured that
+ * its plan searches there although the model is spoken to on another wire (`anthropicSearch`).
+ * No preset lists a model today: OpenCode Go's, once believed to search for DeepSeek on its
+ * Anthropic endpoint, never did (corrected 2026-10-21), so the search is refused there rather
+ * than fabricated. DeepSeek's search works only on DeepSeek's own API.
+ */
+export function searchProviderFor(provider: Provider | undefined, model: string): AnthropicCompatibleProvider | undefined {
+  const presetId = provider && "preset" in provider ? provider.preset : undefined;
+  const search = presetId ? PRESETS.find((entry) => entry.id === presetId)?.anthropicSearch : undefined;
+  if (!provider || !search || !search.models.includes(model)) return undefined;
+  const headers = reauthorized("headers" in provider ? provider.headers : undefined, search.authHeader);
+  const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
+  return {
+    type: "anthropic-compatible",
+    url: search.url,
+    ...(headers ? { headers } : {}),
+    ...(sessionHeader ? { sessionHeader } : {}),
+    ...(presetId ? { preset: presetId } : {}),
+  };
 }
 
 export type Route = {
@@ -269,6 +394,8 @@ export type CliModel = {
 };
 
 export type Config = {
+  /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
+  autoUpdate?: boolean;
   listen: { host: string; port: number; /** OpenAI-compatible ingress port. Defaults to port + 2. */ openaiPort?: number };
   upstream: string;
   providers: Record<string, Provider>;
@@ -325,7 +452,12 @@ export type Config = {
    * hosted search answers instead. Absent, nothing is intercepted and the search behaves as before.
    */
   webSearch?: {
-    /** A key of `providers`, speaking an OpenAI-compatible Chat Completions API with a web plugin. */
+    /**
+     * A key of `providers`. The backend follows how that provider is spoken to: an
+     * `anthropic-compatible` one is handed Anthropic's `web_search` server tool (only where its
+     * preset or caps measured support), an `openai-compatible` one is asked through its Chat
+     * Completions web plugin, and a `chatgpt` provider uses its own hosted search.
+     */
     provider: string;
     /** The model that runs the search. Its hosted search does the work, so a small one is enough. */
     model: string;
@@ -347,7 +479,91 @@ export type Config = {
    * with our proxy (both done by `clauderipple picker on`).
    */
   picker?: { enabled: boolean; hosts?: string[] };
+  /**
+   * Remote (SSH) hosts that run Claude Code for Claude Desktop sessions. The router holds a reverse
+   * tunnel to each (remote-tunnel.ts), so the remote's 127.0.0.1:<port> reaches this proxy. Written
+   * by `clauderipple remote add|remove`, which also sets up the remote side (remote-host.ts).
+   */
+  remote?: { hosts: { host: string; port: number }[] };
+  /**
+   * Keep a MacBook awake with its lid closed (awake.ts). Off unless set. Needs the one-time
+   * `clauderipple awake setup`, which installs a narrow sudoers rule for `pmset -a disablesleep`.
+   */
+  awake?: Partial<AwakeSettings>;
+  /** Fail over to the iPhone hotspot when Wi-Fi has no internet, and come back later (tether.ts). Off unless set. */
+  tether?: Partial<TetherSettings>;
 };
+
+export type AwakeMode = "off" | "working" | "on";
+export type AwakeSettings = {
+  /** off: never touch sleep. working: while model calls run and for 10 min after. on: always (until `until`). */
+  mode: AwakeMode;
+  /** ISO time after which the mode stops holding the Mac awake. */
+  until?: string;
+  /** On battery below this percentage, sleep is allowed again whatever the mode. */
+  batteryFloorPercent: number;
+};
+export type TetherSettings = {
+  enabled: boolean;
+  /** The iPhone's Personal Hotspot network name, exactly as the sudoers rule names it. */
+  hotspotSsid: string;
+  probeEverySec: number;
+};
+
+export const AWAKE_DEFAULTS: AwakeSettings = { mode: "off", batteryFloorPercent: 20 };
+export const TETHER_DEFAULTS: TetherSettings = { enabled: false, hotspotSsid: "", probeEverySec: 10 };
+
+export function awakeSettings(c: Config): AwakeSettings {
+  return { ...AWAKE_DEFAULTS, ...(c.awake ?? {}) } as AwakeSettings;
+}
+
+export function tetherSettings(c: Config): TetherSettings {
+  const t = { ...TETHER_DEFAULTS, ...(c.tether ?? {}) } as TetherSettings & Record<string, unknown>;
+  // A config from before 2026-10-20 still carries `returnEverySec`; it loads fine (unknown keys are
+  // not refused) and is dropped here rather than carried into the controller's settings.
+  return { enabled: t.enabled, hotspotSsid: t.hotspotSsid, probeEverySec: t.probeEverySec };
+}
+
+/**
+ * A hotspot name is written into a sudoers rule and handed to `networksetup` as one argument, so it
+ * is held to a charset that is literal in both: letters, digits, single spaces, `. _ -`, and the
+ * straight and typographic apostrophes iPhone names use ("Name’s iPhone"). Nothing sudoers or fnmatch
+ * reads specially (`, : = \ * ? [ ] #` and quotes) can get through. Returns what is wrong, or null.
+ */
+export function ssidProblem(ssid: unknown): string | null {
+  if (typeof ssid !== "string" || !ssid) return "the hotspot name is empty";
+  if (Buffer.byteLength(ssid, "utf8") > 32) return "a Wi-Fi name is at most 32 bytes";
+  if (!/^[A-Za-z0-9 ._'’-]+$/u.test(ssid)) return "the hotspot name may contain only letters, digits, spaces and . _ - ' ’";
+  if (/^ | $|  /.test(ssid)) return "the hotspot name cannot start or end with a space or contain two in a row";
+  if (ssid.startsWith("-")) return "the hotspot name cannot start with -";
+  return null;
+}
+
+function validatePower(c: Config, errors: string[]): void {
+  if (c.awake !== undefined) {
+    const a = c.awake as Record<string, unknown> | null;
+    if (!a || typeof a !== "object" || Array.isArray(a)) errors.push("awake must be an object");
+    else {
+      if (a.mode !== undefined && a.mode !== "off" && a.mode !== "working" && a.mode !== "on") errors.push('awake.mode must be "off", "working" or "on"');
+      if (a.until !== undefined && (typeof a.until !== "string" || Number.isNaN(Date.parse(a.until)))) errors.push("awake.until must be an ISO date-time");
+      if (a.batteryFloorPercent !== undefined && !(typeof a.batteryFloorPercent === "number" && a.batteryFloorPercent >= 0 && a.batteryFloorPercent <= 100)) errors.push("awake.batteryFloorPercent must be a number from 0 to 100");
+    }
+  }
+  if (c.tether !== undefined) {
+    const t = c.tether as Record<string, unknown> | null;
+    if (!t || typeof t !== "object" || Array.isArray(t)) errors.push("tether must be an object");
+    else {
+      if (t.enabled !== undefined && typeof t.enabled !== "boolean") errors.push("tether.enabled must be true or false");
+      if (t.hotspotSsid !== undefined && t.hotspotSsid !== "") {
+        const problem = ssidProblem(t.hotspotSsid);
+        if (problem) errors.push(`tether.hotspotSsid: ${problem}`);
+      }
+      if (t.probeEverySec !== undefined && !(typeof t.probeEverySec === "number" && t.probeEverySec >= 5 && t.probeEverySec <= 3600)) errors.push("tether.probeEverySec must be a number from 5 to 3600");
+      // `tether.returnEverySec` was dropped on 2026-10-20 (the way back is a fixed schedule now).
+      // A config still carrying it is left alone: unknown keys are not refused here.
+    }
+  }
+}
 
 export const PICKER_HOSTS_DEFAULT = ["claude.ai"];
 
@@ -369,6 +585,10 @@ export const DEFAULTS: Config = {
   health: { maxConsecutiveUpstreamFailures: 20 },
   log: { maxBytes: 5 * 1024 * 1024, keep: 3 },
 };
+
+export function adminPort(cfg: Config): number {
+  return cfg.admin?.port ?? cfg.listen.port + 1;
+}
 
 export function homeDir(): string {
   return process.env.CLAUDERIPPLE_HOME ?? path.join(os.homedir(), ".clauderipple");
@@ -404,12 +624,14 @@ export function headerValueProblem(value: string): string | null {
     if (code > 0xff) return `character ${i + 1} is "${value[i]}", which cannot travel in an HTTP header — paste the key on its own, without any label or surrounding text`;
     // A newline would split the header; a stray one usually means a copied line rather than a key.
     if (code === 0x0a || code === 0x0d) return `there is a line break at character ${i + 1} — paste the key on its own, without the line around it`;
+    // fetch refuses a NUL too, so a value that passes here would only fail when sent.
+    if (code === 0x00) return `there is a NUL character at character ${i + 1} — paste the key on its own`;
   }
   return null;
 }
 
 /** Named once because three provider kinds report it, and a drifting copy would describe the wrong shape. */
-const MODELS_SHAPE = 'models must be entries with a string id and optional name, effortLevels, url, wire ("chat" | "responses" | "anthropic") and authHeader ("x-api-key" | "authorization-bearer")';
+const MODELS_SHAPE = 'models must be entries with a string id and optional name, effortLevels, url, wire ("chat" | "responses" | "anthropic" | "google") and authHeader ("x-api-key" | "authorization-bearer")';
 
 function validModels(models: unknown): boolean {
   return Array.isArray(models) && models.every((model) => {
@@ -420,7 +642,7 @@ function validModels(models: unknown): boolean {
     if (m.effortLevels !== undefined && (!Array.isArray(m.effortLevels) || m.effortLevels.some((level) => typeof level !== "string"))) return false;
     // A model's own wire, endpoint and auth convention: wrong here and the request goes out in the
     // wrong shape to the wrong path, which reads as a provider that rejects a working key.
-    if (m.wire !== undefined && m.wire !== "chat" && m.wire !== "responses" && m.wire !== "anthropic") return false;
+    if (m.wire !== undefined && m.wire !== "chat" && m.wire !== "responses" && m.wire !== "anthropic" && m.wire !== "google") return false;
     if (m.url !== undefined && (typeof m.url !== "string" || !/^https?:\/\//.test(m.url))) return false;
     if (m.authHeader !== undefined && m.authHeader !== "x-api-key" && m.authHeader !== "authorization-bearer") return false;
     return true;
@@ -514,6 +736,7 @@ function foldSplitProviders(c: Config): Config {
 
 export function validate(c: Config): string[] {
   const errors: string[] = [];
+  if (c.autoUpdate !== undefined && typeof c.autoUpdate !== "boolean") errors.push("autoUpdate must be true or false");
   if (c.autoModeClassifier !== undefined) {
     const target = c.autoModeClassifier;
     if (!target || typeof target !== "object") errors.push("autoModeClassifier must be an object");
@@ -523,6 +746,19 @@ export function validate(c: Config): string[] {
       else if (provider.type === "anthropic" && !provider.accountPool) errors.push("autoModeClassifier: provider is ingress-only");
       if (typeof target.model !== "string" || !target.model.trim()) errors.push("autoModeClassifier: missing model");
       if (target.effort !== undefined && typeof target.effort !== "string") errors.push("autoModeClassifier: effort must be a string");
+    }
+  }
+  if (c.webSearch !== undefined) {
+    // Hand-edited config.json reaches here as whatever JSON held, not the declared type.
+    const target = c.webSearch as { provider?: unknown; model?: unknown; maxResults?: unknown } | null;
+    if (!target || typeof target !== "object" || Array.isArray(target)) errors.push("webSearch must be an object");
+    else {
+      if (typeof target.provider !== "string" || !target.provider.trim()) errors.push("webSearch: missing provider");
+      else if (!c.providers[target.provider]) errors.push(`webSearch: unknown provider "${target.provider}"`);
+      if (typeof target.model !== "string" || !target.model.trim()) errors.push("webSearch: missing model");
+      if (target.maxResults !== undefined && (!Number.isInteger(target.maxResults) || (target.maxResults as number) <= 0)) {
+        errors.push("webSearch: maxResults must be a positive integer");
+      }
     }
   }
   for (const [alias, r] of Object.entries(c.routes)) {
@@ -548,9 +784,10 @@ export function validate(c: Config): string[] {
   }
   for (const [name, p] of Object.entries(c.providers)) {
     // Carried by every provider that puts together a system prompt, so checked once for all of them.
-    const shared = p as { identity?: unknown; instructionsAppend?: unknown };
+    const shared = p as { identity?: unknown; instructionsAppend?: unknown; limits?: unknown };
     if (shared.identity !== undefined && typeof shared.identity !== "boolean") errors.push(`provider ${name}: identity must be true or false`);
     if (shared.instructionsAppend !== undefined && typeof shared.instructionsAppend !== "string") errors.push(`provider ${name}: instructionsAppend must be a string`);
+    if (shared.limits !== undefined && typeof shared.limits !== "boolean") errors.push(`provider ${name}: limits must be true or false`);
     // Ids key the router's cooldown and quarantine state, so a duplicate would make two credentials
     // share one health record and take each other down.
     const pool = (p as { credentials?: unknown }).credentials;
@@ -598,6 +835,12 @@ export function validate(c: Config): string[] {
         errors.push(`provider ${name}: ${MODELS_SHAPE}`);
       }
       if (p.url && !/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
+      // Only the shape is refused here. A value inside that is not a boolean is not an error: it is
+      // read as off (fastSwitches), so a hand-edited file cannot put the router on a tier by
+      // accident, and one odd value does not keep the whole config from loading.
+      if (p.fast !== undefined && (!p.fast || typeof p.fast !== "object" || Array.isArray(p.fast))) {
+        errors.push(`provider ${name}: fast must be an object with main and subagent booleans`);
+      }
     } else if (p.type === "openai-compatible") {
       if (!/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
       if (p.wire !== undefined && p.wire !== "chat" && p.wire !== "responses") errors.push(`provider ${name}: wire must be "chat" or "responses"`);
@@ -620,6 +863,11 @@ export function validate(c: Config): string[] {
       if (p.apiKey !== undefined && typeof p.apiKey !== "string") errors.push(`provider ${name}: apiKey must be a string`);
       if (p.url !== undefined && !/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
       if (p.defaultEffort !== undefined && typeof p.defaultEffort !== "string") errors.push(`provider ${name}: defaultEffort must be a string`);
+      if (p.sessionHeader !== undefined && (typeof p.sessionHeader !== "string" || !p.sessionHeader)) errors.push(`provider ${name}: sessionHeader must be a non-empty string`);
+      if (p.headers !== undefined && (!p.headers || typeof p.headers !== "object" || Array.isArray(p.headers) || Object.values(p.headers).some((value) => typeof value !== "string"))) {
+        errors.push(`provider ${name}: headers must be a string record`);
+      }
+      if (p.preset !== undefined && typeof p.preset !== "string") errors.push(`provider ${name}: preset must be a string`);
       if (p.models !== undefined && !validModels(p.models)) {
         errors.push(`provider ${name}: ${MODELS_SHAPE}`);
       }
@@ -631,6 +879,22 @@ export function validate(c: Config): string[] {
       if (p.models !== undefined && !validModels(p.models)) {
         errors.push(`provider ${name}: ${MODELS_SHAPE}`);
       }
+    } else if (p.type === "grok") {
+      for (const field of ["home", "cli", "clientVersion"] as const) {
+        if (p[field] !== undefined && (typeof p[field] !== "string" || !p[field])) errors.push(`provider ${name}: ${field} must be a non-empty string`);
+      }
+      // Sent as `x-grok-client-version`, so it has to survive being a header value.
+      const versionProblem = typeof p.clientVersion === "string" && p.clientVersion ? headerValueProblem(p.clientVersion) : null;
+      if (versionProblem) errors.push(`provider ${name}: clientVersion cannot be sent as a header: ${versionProblem}`);
+      if (p.url !== undefined && !/^https?:\/\//.test(p.url)) errors.push(`provider ${name}: url must start with http:// or https://`);
+      if (p.models !== undefined) {
+        if (!validModels(p.models)) errors.push(`provider ${name}: ${MODELS_SHAPE}`);
+        // `providerFor` turns a model with its own wire, url or auth header into an openai-compatible
+        // provider, which would go out without the session headers this one exists to add.
+        else if (p.models.some((m) => m.wire !== undefined || m.url !== undefined || m.authHeader !== undefined)) {
+          errors.push(`provider ${name}: a grok model cannot set wire, url or authHeader`);
+        }
+      }
     } else {
       errors.push(`provider ${name}: unknown type "${(p as { type?: string }).type}"`);
     }
@@ -639,6 +903,26 @@ export function validate(c: Config): string[] {
   if (c.cli.agentFiles !== undefined && typeof c.cli.agentFiles !== "boolean") errors.push("cli.agentFiles must be true or false");
   if (c.cli.limitWorkerTools !== undefined && typeof c.cli.limitWorkerTools !== "boolean") errors.push("cli.limitWorkerTools must be true or false");
   if (c.listen.openaiPort !== undefined && !(c.listen.openaiPort >= 0 && c.listen.openaiPort < 65536)) errors.push("listen.openaiPort out of range");
+  if (c.remote !== undefined) {
+    const hosts = (c.remote as { hosts?: unknown } | null)?.hosts;
+    if (!Array.isArray(hosts)) errors.push("remote.hosts must be a list");
+    else {
+      const seen = new Set<string>();
+      hosts.forEach((entry, i) => {
+        const h = entry as { host?: unknown; port?: unknown } | null;
+        if (!h || typeof h !== "object") { errors.push(`remote.hosts ${i} must be an object`); return; }
+        // Handed to ssh as an argument: the same check `remote add` applies, so a hand edit cannot
+        // slip an option such as -oProxyCommand into the router's own ssh.
+        const hostError = hostProblem(h.host);
+        if (hostError) errors.push(`remote.hosts ${i}: ${hostError}`);
+        else if (seen.has(h.host as string)) errors.push(`remote.hosts ${i}: "${String(h.host)}" is listed twice`);
+        else seen.add(h.host as string);
+        const portError = portProblem(h.port);
+        if (portError) errors.push(`remote.hosts ${i}: ${portError}`);
+      });
+    }
+  }
+  validatePower(c, errors);
   return errors;
 }
 

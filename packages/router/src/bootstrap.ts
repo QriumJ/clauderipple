@@ -8,6 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import type { Config } from "./config.ts";
 import { agentAliases } from "./agents.ts";
+import { isJudgeOnlyModel } from "./model-policy.ts";
+import { chatPickerModels, providerModelWindow } from "./picker.ts";
 
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
 
@@ -30,7 +32,7 @@ export function agentModelIds(dirs: string[] = [path.join(os.homedir(), ".claude
       try {
         const head = fs.readFileSync(path.join(dir, f), "utf8").slice(0, 8192);
         const m = /^model:\s*['"]?([A-Za-z0-9._\/:\-]+(?:@[a-z]+)?)/m.exec(head);
-        if (m) out.add(m[1]!);
+        if (m && !isJudgeOnlyModel(m[1]!)) out.add(m[1]!);
       } catch {
         /* unreadable: skip */
       }
@@ -59,9 +61,10 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
       const [base, effort] = id.split("@");
       const named = cfg.cli.extraModels.find((m) => m.model === base);
       // An "<model>@<effort>" entry is the same model with a different effort, so it has the same window.
-      return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(named?.contextWindow ? { contextWindow: named.contextWindow } : {}) };
+      const window = named?.contextWindow ?? providerModelWindow({ ...cfg, aliases }, base ?? id);
+      return { model: id, name: `${named?.name ?? base}${effort ? ` · ${effort}` : ""}`, ...(window ? { contextWindow: window } : {}) };
     });
-  const extra = [...cfg.cli.extraModels, ...fromAgents];
+  const extra = chatPickerModels({ ...cfg, aliases, cli: { ...cfg.cli, extraModels: [...cfg.cli.extraModels, ...fromAgents] } });
   const win = cfg.cli.autoCompactWindow;
   // Routed models do not share a context window; the global value is only the fallback for entries
   // that do not name their own, so a per-entry window alone is reason enough to write the map.

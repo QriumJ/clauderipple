@@ -34,6 +34,7 @@ import { CredentialPool } from "../src/pool.ts";
 import { Logger } from "../src/log.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 import type { GeminiRequest } from "../src/providers/google/translate.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 const log = new Logger(null, 1e9, 0, false);
 const tempHome = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "cr-google-ag-"));
@@ -56,7 +57,7 @@ test("store: a re-login replaces the same account, a different one is added; the
   assert.equal(stored.length, 2);
   assert.equal(stored[0]!.accessToken, "tok-new");
   const mode = fs.statSync(googleAccountsPath(home)).mode & 0o777;
-  assert.equal(mode, 0o600, "the token file is private");
+  if (posixModes) assert.equal(mode, 0o600, "the token file is private");
 });
 
 test("store: remove and compare-and-swap refresh", () => {
@@ -347,7 +348,7 @@ test("a turn streams through the CCA envelope, carrying the account token and pr
     assert.match(sent.path, /v1internal:streamGenerateContent\?alt=sse/);
     assert.equal(sent.headers.authorization, "Bearer tok-a");
     assert.equal((sent.body as { project?: string }).project, "proj-1");
-    assert.equal((sent.body as { model?: string }).model, "gemini-3.8-flash-high", "the wire id carries the resolved tier");
+    assert.equal((sent.body as { model?: string }).model, "gemini-3.8-flash-medium", "high rides on the medium tier");
   } finally {
     upstream.close();
   }

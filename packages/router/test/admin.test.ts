@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { effortLevelsForModel, googleHealth, parseUpdateCheck, startAdmin } from "../src/admin.ts";
+import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps } from "../src/admin.ts";
 import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import { RequestLog } from "../src/requestlog.ts";
@@ -15,16 +15,24 @@ import { PRESETS } from "../src/presets.ts";
 import { saveClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
 import { listClaudeAccounts, readClaudeAccountsFile, saveClaudeOAuthAccount } from "../src/providers/anthropic-accounts.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
+import type { ModOptions } from "../src/admin.ts";
+import type { ModSettingsSnapshot } from "../src/mod-settings.ts";
+import { MOD_SETTINGS_SCHEMA_VERSION, normalizeSettings } from "../../mod/hooks/settings.ts";
 
 function makeCfg(overrides: Partial<Config> = {}): Config {
   // port 0: let the OS pick a free ephemeral port so parallel tests never collide.
   return { ...DEFAULTS, admin: { port: 0 }, ...overrides };
 }
 
+const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
+
 async function withAdmin(
   cfgInit: Config,
   fn: (ctx: { port: number; configFile: string; home: string; setCfg: (c: Config) => void }) => Promise<void>,
   extraDeps: {
+    agentDir?: string;
+    credentials?: NonNullable<AdminDeps["credentials"]>;
+    providerHealth?: NonNullable<AdminDeps["providerHealth"]>;
     shutdown?: () => void;
     runCli?: (args: string[], timeout?: number) => Promise<{ ok: boolean; output: string }>;
     startCliDetached?: (args: string[], log: string) => void;
@@ -34,8 +42,11 @@ async function withAdmin(
     probeFetch?: (url: string, init: RequestInit) => Promise<Response>;
     measureFetch?: (url: string, init: RequestInit) => Promise<Response>;
     modelCatalog?: () => Promise<unknown>;
-    chatgpt?: () => { quota: Record<string, Record<string, unknown> | null>; auth: Record<string, string>; refresh?: (name: string) => Promise<Record<string, unknown> | null>; models?: (name: string) => Promise<ProviderModel[] | null> };
-    google?: () => { accounts: () => Record<string, GoogleAccountStatus[]>; models?: (name: string) => Promise<ProviderModel[] | null>; clearCooldown?: (id: string) => void };
+    modelScoresFetch?: typeof fetch;
+    chatgpt?: NonNullable<AdminDeps["chatgpt"]>;
+    google?: NonNullable<AdminDeps["google"]>;
+    opencodeUsage?: NonNullable<AdminDeps["opencodeUsage"]>;
+    claudeUsage?: NonNullable<AdminDeps["claudeUsage"]>;
     googleOAuthFetch?: (url: string, init?: RequestInit) => Promise<Response>;
     googleOAuthPort?: number;
   } = {},
@@ -63,6 +74,7 @@ async function withAdmin(
       health: () => 0,
       version: "0.0.0-test",
       requests: new RequestLog(path.join(home, "logs", "requests.jsonl")),
+      claudeCodeCredentialReaders: noClaudeCodeCredentialReaders,
       ...extraDeps,
     });
     await fn({ port: admin.port, configFile, home, setCfg: (c) => (cfg = c) });
@@ -77,6 +89,338 @@ async function withAdmin(
 }
 
 const base = () => `http://127.0.0.1`;
+
+test("mod options and status expose runtime provider exhaustion and clear it on recovery", async () => {
+  const { ProviderHealth, providerExhaustion } = await import('../src/health.ts');
+  const health = new ProviderHealth();
+  health.observe('deepseek', 402, providerExhaustion(402, 'Insufficient Balance'));
+  const cfg = makeCfg({ providers: { deepseek: { type: 'anthropic-compatible', url: 'http://127.0.0.1:1' } } });
+  await withAdmin(cfg, async ({ port }) => {
+    const options = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+    assert.equal(options.providers[0]?.usable, false);
+    assert.equal(options.providers[0]?.reason, 'insufficient_balance');
+    assert.ok(options.providers[0]?.exhaustedAt);
+    const status = await (await fetch(`${base()}:${port}/api/status`)).json() as { providers: Record<string, { usable: boolean; exhaustion?: { reason: string } }> };
+    assert.equal(status.providers.deepseek?.usable, false);
+    assert.equal(status.providers.deepseek?.exhaustion?.reason, 'insufficient_balance');
+    health.observe('deepseek', 200);
+    const recovered = await (await fetch(`${base()}:${port}/api/mod-options`)).json() as ModOptions;
+    assert.equal(recovered.providers[0]?.usable, true);
+    assert.equal(recovered.providers[0]?.reason, undefined);
+  }, { providerHealth: () => health.snapshot(), modelScoresFetch: async () => new Response('{}') });
+});
+
+const putModSettings = (port: number, body: unknown) => fetch(`${base()}:${port}/api/mod-settings`, {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: MOD_SETTINGS_SCHEMA_VERSION, ...(body as Record<string, unknown>) }),
+});
+
+test("admin mod-settings rejects an old session's full empty/default overwrite even at the current revision", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const steps = [{ target: { agent: "first" }, effort: "high" }, { target: { agent: "second" }, effort: "medium" }];
+    const settings = normalizeSettings({ rules: { general: { mode: "ladder", rungs: { light: steps, standard: steps, hard: steps, plan: steps } } }, modes: [{ id: "saved", name: "Saved mode", rungs: { hard: steps }, delegation: "eager", until: "none" }], activeMode: "saved" });
+    const file = path.join(home, "mod-settings.json");
+    const original = JSON.stringify({ settings, revision: 9, stored: true });
+    fs.writeFileSync(file, original);
+    // Pre-a931858 reads Step[] as no Step. An unrelated toggle PUTs empty rungs,
+    // and the admin fill used to turn that into a complete default overwrite.
+    for (const lost of [{ ...settings, rules: { general: { mode: "ladder", rungs: {} } }, modes: [] }, normalizeSettings(null)]) {
+      const response = await putModSettings(port, { settings: lost, revision: 9, schemaVersion: undefined });
+      assert.equal(response.status, 426);
+      assert.equal(fs.readFileSync(file, "utf8"), original);
+    }
+  });
+});
+
+test("admin mod-settings keeps ten exact previous files and refuses unsupported schemas without backups", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const file = path.join(home, "mod-settings.json");
+    const previous = new Map<number, string>();
+    // An old file need not be normalized or formatted like today's serializer.
+    fs.writeFileSync(file, '{"revision":1,"settings":{"language":"pt","future":"preserve in backup"}}');
+    for (let revision = 1; revision <= 12; revision++) {
+      previous.set(revision, fs.readFileSync(file, "utf8"));
+      const response = await putModSettings(port, { settings: { language: "ko" }, revision });
+      assert.equal(response.status, 200);
+    }
+    const names = fs.readdirSync(home).filter(name => name.startsWith("mod-settings.json.bak-"));
+    assert.equal(names.length, 10);
+    for (let revision = 3; revision <= 12; revision++) {
+      const backup = `${file}.bak-${revision}`;
+      assert.equal(fs.readFileSync(backup, "utf8"), previous.get(revision));
+      if (process.platform !== "win32") assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+    }
+    const final = fs.readFileSync(file, "utf8");
+    for (const schemaVersion of [undefined, 0, 2, "1", null]) {
+      assert.equal((await putModSettings(port, { schemaVersion, settings: {}, revision: 13 })).status, 426);
+    }
+    assert.equal((await putModSettings(port, { settings: {}, revision: 0 })).status, 409);
+    assert.equal(fs.readFileSync(file, "utf8"), final);
+    assert.deepEqual(fs.readdirSync(home).filter(name => name.startsWith("mod-settings.json.bak-")), names);
+    // Current writers may deliberately shorten a list or remove a saved mode.
+    assert.equal((await putModSettings(port, { settings: normalizeSettings(null), revision: 13 })).status, 200);
+  });
+});
+
+test("admin mod-settings returns full defaults before storage, normalizes writes and persists revisions", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const defaults = { settings: normalizeSettings(null), revision: 0, stored: false };
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), defaults);
+    const input = { effortAuto: false, judge: "invalid", layout: "invalid", language: "invalid", keepWarmMinTokens: 1234, rules: { general: { mode: "auto", allow: [] } }, future: [1, null, { nested: true }] };
+    // Auto is a ladder with no rung set; saving fills it from the connected models (here only Claude's own).
+    const claude = (model: string, effort: string) => ({ target: { agent: "general-purpose", model }, effort });
+    const settings = normalizeSettings({ ...input, rules: { general: { mode: "ladder", rungs: { light: claude("haiku", "low"), standard: claude("sonnet", "medium"), hard: claude("opus", "high"), plan: claude("opus", "high") } } } });
+    const saved = await putModSettings(port, { settings: input, revision: 0 });
+    assert.equal(saved.status, 200);
+    const snapshot = { settings, revision: 1, stored: true };
+    assert.deepEqual(await saved.json(), snapshot);
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), snapshot);
+    assert.equal(settings.judge, defaults.settings.judge);
+    assert.equal(settings.layout, defaults.settings.layout);
+    assert.equal(settings.language, defaults.settings.language);
+    assert.equal(settings.keepWarmMinTokens, 1234);
+    const file = path.join(home, "mod-settings.json");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), snapshot);
+    if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.equal((await (await putModSettings(port, { settings })).json() as ModSettingsSnapshot).revision, 2);
+    assert.deepEqual(fs.readdirSync(home).filter(name => /mod-settings.*(tmp|lock)/.test(name)), []);
+  });
+});
+
+test("admin mod-settings empty-store conflicts include normalized defaults and stored false", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const response = await putModSettings(port, { settings: { language: "ko" }, revision: 1 });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { settings: normalizeSettings(null), revision: 0, stored: false });
+    assert.equal(fs.existsSync(path.join(home, "mod-settings.json")), false);
+  });
+});
+
+test("admin mod-settings normalizes legacy stored settings on GET without rewriting their revision", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const old = { settings: { layout: "invalid", language: "pt", tiers: { light: { agent: "legacy" } } }, revision: 7 };
+    const file = path.join(home, "mod-settings.json");
+    fs.writeFileSync(file, JSON.stringify(old));
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(old.settings), revision: 7, stored: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), old);
+  });
+});
+
+test("admin mod-settings reads Auto and field rules as the four workers, fills empty rungs from the ticked models and says it once", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const file = path.join(home, "mod-settings.json");
+    const old = { settings: { language: "ko", rules: { general: { mode: "auto", allow: ["general-purpose:sonnet", "general-purpose:opus"] }, backend: { mode: "auto", allow: [] } } }, revision: 7 };
+    fs.writeFileSync(file, JSON.stringify(old));
+    const got = await (await fetch(`${base()}:${port}/api/mod-settings`)).json() as ModSettingsSnapshot;
+    assert.equal(got.legacy, true);
+    assert.deepEqual(got.settings.allow, ["general-purpose:sonnet", "general-purpose:opus"]);
+    assert.deepEqual(Object.keys(got.settings.rules), ["general"], "field rules are dropped");
+    const general = got.settings.rules.general;
+    assert.equal(general.mode, "ladder");
+    // Only Sonnet and Opus are ticked: Haiku cannot stand on Low, so Low takes the session model.
+    assert.deepEqual(general.rungs.light, [{ target: { agent: "general-purpose" }, effort: "max" }]);
+    assert.deepEqual([general.rungs.standard, general.rungs.hard, general.rungs.plan].map(steps => steps?.[0]?.target.model), ["sonnet", "opus", "opus"]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), old, "reading rewrites nothing");
+    // The first save drops what was retired, so the note is said once.
+    const saved = await (await putModSettings(port, { settings: got.settings, revision: 7 })).json() as ModSettingsSnapshot;
+    assert.equal(saved.revision, 8);
+    assert.equal(Object.hasOwn(saved, "legacy"), false);
+    assert.equal(Object.hasOwn(await (await fetch(`${base()}:${port}/api/mod-settings`)).json() as object, "legacy"), false);
+    // Existing ordered lists survive allow-list changes; dispatch skips unticked entries.
+    const kept = { target: { agent: "general-purpose", model: "opus" }, effort: "xhigh" };
+    const unticked = await (await putModSettings(port, { settings: { allow: ["general-purpose:opus"], rules: { general: { mode: "ladder", rungs: { light: kept, standard: { target: { agent: "gpt-6-1-sol" }, effort: "low" } } } } } })).json() as ModSettingsSnapshot;
+    const rungs = unticked.settings.rules.general.mode === "ladder" ? unticked.settings.rules.general.rungs : {};
+    assert.deepEqual(rungs.light, [kept]);
+    assert.equal(rungs.standard?.[0]?.target.model, undefined);
+    assert.deepEqual(rungs.standard?.[0]?.target, { agent: "gpt-6-1-sol" });
+  });
+});
+
+test("admin fills Base and mode domain ladders even when every general rung is already full", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const kept = [{ target: { agent: 'general-purpose', model: 'sonnet' }, effort: 'high' }];
+    const full = { light: kept, standard: kept, hard: kept, plan: kept };
+    const input = normalizeSettings({ rules: { general: { mode: 'ladder', rungs: full } }, domainRules: {
+      ui: { mode: 'ladder', rungs: { light: kept } }, backend: { mode: 'ladder', rungs: {} },
+    }, modes: [
+      { id: 'own', name: 'Own', rungs: full, domainRules: { ui: { mode: 'ladder', rungs: {} }, backend: { mode: 'ladder', rungs: { hard: kept } } } },
+      { id: 'plain', name: 'Plain', rungs: full },
+    ] });
+    const saved = await (await putModSettings(port, { settings: input, revision: 0 })).json() as ModSettingsSnapshot;
+    assert.equal(saved.revision, 1);
+    assert.deepEqual(saved.settings.rules.general, input.rules.general);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.light, kept);
+    assert.deepEqual(saved.settings.modes[0]!.domainRules!.backend!.rungs.hard, kept);
+    for (const set of [saved.settings, saved.settings.modes[0]!]) {
+      for (const rule of Object.values(set.domainRules!)) {
+        assert.deepEqual(Object.keys(rule.rungs).sort(), ['hard', 'light', 'plan', 'standard']);
+        assert.ok(Object.values(rule.rungs).every(steps => steps.length > 0));
+        // A domain ladder has two levels: the fill leaves each pair holding one list.
+        assert.deepEqual(rule.rungs.light, rule.rungs.standard);
+        assert.deepEqual(rule.rungs.hard, rule.rungs.plan);
+      }
+    }
+    assert.equal(Object.hasOwn(saved.settings.modes[1]!, 'domainRules'), false);
+    assert.equal(saved.legacy, undefined);
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), saved);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'mod-settings.json'), 'utf8')), saved);
+  });
+});
+
+test("admin folds a domain ladder into two levels and leaves the general ladder's four rungs", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const light = [{ target: { agent: "general-purpose", model: "haiku" }, effort: "low" }];
+    const standard = [{ target: { agent: "general-purpose", model: "sonnet" }, effort: "medium" }];
+    const hard = [{ target: { agent: "general-purpose", model: "opus" }, effort: "high" }];
+    const plan = [{ target: { agent: "general-purpose", model: "opus" }, effort: "xhigh" }];
+    const input = normalizeSettings({ rules: { general: { mode: "ladder", rungs: { light, standard, hard, plan } } }, domainRules: {
+      ui: { mode: "ladder", rungs: { light, standard, hard, plan } },
+    } });
+    const saved = await (await putModSettings(port, { settings: input, revision: 0 })).json() as ModSettingsSnapshot;
+    // The general ladder keeps its four rungs.
+    assert.deepEqual(saved.settings.rules.general.rungs, { light, standard, hard, plan });
+    // The domain ladder's pairs hold one list each: standard's for the light pair, plan's for the heavy one.
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.light, standard);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.standard, standard);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.hard, plan);
+    assert.deepEqual(saved.settings.domainRules!.ui!.rungs.plan, plan);
+  });
+});
+
+test("admin mod-settings round-trips allowKnown, the keys the allow-list was last written with", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const known = ["deepseek-v4-1-flash", "gpt-6-1-sol", "gpt-6-astra", "general-purpose:haiku", "general-purpose:sonnet", "general-purpose:opus", "general-purpose:fable"];
+    const saved = await (await putModSettings(port, { settings: { allow: ["gpt-6-1-sol"], allowKnown: known } })).json() as ModSettingsSnapshot;
+    assert.deepEqual(saved.settings.allow, ["gpt-6-1-sol"]);
+    assert.deepEqual(saved.settings.allowKnown, known);
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), saved, "the stored copy carries allowKnown too");
+    // A default-sized list (every model ticked) resets both to empty.
+    const all = await (await putModSettings(port, { settings: { allow: [], allowKnown: [] } })).json() as ModSettingsSnapshot;
+    assert.deepEqual(all.settings.allow, []);
+    assert.deepEqual(all.settings.allowKnown, []);
+  });
+});
+
+test("admin mod-settings stale revisions return current settings; concurrent CAS has one winner", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const responses = await Promise.all([putModSettings(port, { settings: { language: "ko" }, revision: 0 }), putModSettings(port, { settings: { language: "ja" }, revision: 0 })]);
+    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+    const current = await (await fetch(`${base()}:${port}/api/mod-settings`)).json() as ModSettingsSnapshot;
+    assert.equal(current.stored, true);
+    assert.equal(current.revision, 1);
+    assert.deepEqual(current.settings, normalizeSettings(current.settings));
+    for (const response of responses) assert.deepEqual(await response.json(), current);
+    const stale = await putModSettings(port, { settings: {}, revision: 0 });
+    assert.equal(stale.status, 409);
+    assert.deepEqual(await stale.json(), current);
+  });
+});
+
+test("admin mod-settings refuses nonobjects, invalid revisions and secrets at any depth without changing the store", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    for (const settings of [null, [], "text", 1, { apiKey: "hidden" }, { nested: [{ TOKEN: "hidden" }] }, { deep: { clientSecret: "hidden" } }]) {
+      const response = await putModSettings(port, { settings });
+      assert.equal(response.status, 400, JSON.stringify(settings));
+      assert.doesNotMatch(await response.text(), /hidden/);
+    }
+    for (const revision of [-1, 0.5, null, "0"]) assert.equal((await putModSettings(port, { settings: {}, revision })).status, 400);
+    const malformed = await fetch(`${base()}:${port}/api/mod-settings`, { method: "PUT", body: "{" });
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await (await fetch(`${base()}:${port}/api/mod-settings`)).json(), { settings: normalizeSettings(null), revision: 0, stored: false });
+    // A count named for tokens is a setting the mod has, not a credential.
+    assert.equal((await putModSettings(port, { settings: { keepWarmMinTokens: 30000, rules: { general: { mode: "pin" } } } })).status, 200);
+  });
+});
+
+test("admin mod-settings enforces the UTF-8 64 KiB object limit at the exact boundary", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const limit = 64 * 1024;
+    const overhead = Buffer.byteLength(JSON.stringify({ text: "" }));
+    const settings = { text: "é".repeat(Math.floor((limit - overhead) / 2)) + "a".repeat((limit - overhead) % 2) };
+    assert.equal(Buffer.byteLength(JSON.stringify(settings)), limit);
+    assert.equal((await putModSettings(port, { settings })).status, 200);
+    assert.equal((await putModSettings(port, { settings: { text: settings.text + "a" } })).status, 413);
+    assert.equal((await putModSettings(port, { settings: { text: "a".repeat(1024 * 1024) } })).status, 413, "oversized HTTP bodies receive an error, not a connection reset");
+    assert.equal((await (await fetch(`${base()}:${port}/api/mod-settings`)).json() as ModSettingsSnapshot).revision, 1);
+  });
+});
+
+test("admin mod-settings refuses to overwrite corrupt persistence", async () => {
+  await withAdmin(makeCfg(), async ({ port, home }) => {
+    const file = path.join(home, "mod-settings.json");
+    fs.writeFileSync(file, "{");
+    assert.equal((await putModSettings(port, { settings: {} })).status, 500);
+    assert.equal(fs.readFileSync(file, "utf8"), "{");
+  });
+});
+
+test("admin mod-options offers owned workers, every provider model, judge candidates and attributed AA scores", async () => {
+  const agents = fs.mkdtempSync(path.join(os.tmpdir(), "cr-mod-options-"));
+  const full = { rate_limits: { primary: { used_percent: 100, reset_after_seconds: 600 } } };
+  let refreshed = 0;
+  let credit = false;
+  const cfg = makeCfg({ providers: {
+    codex: { type: "chatgpt", models: [{ id: "gpt-6.1-sol", name: "Sol" }] },
+    zen: { type: "openai-compatible", preset: "opencode-zen", url: "http://127.0.0.1:9", headers: { authorization: "Bearer hidden-credential" }, models: [{ id: "jev-1.13", name: "Jev" }, { id: "deepseek-v4.1-flash" }] },
+    custom: { type: "anthropic-compatible", url: "http://127.0.0.1:9", models: [{ id: "custom-chat" }] },
+    native: { type: "anthropic", auth: "api-key", apiKey: "hidden-api-key", models: [{ id: "claude-sonnet-5-5" }] },
+    google: { type: "google", auth: "antigravity", models: [{ id: "gemini-3.8-flash" }] },
+  }, routes: {}, direct: [], aliases: {} });
+  try {
+    fs.writeFileSync(path.join(agents, "gpt-6-1-sol.md"), "---\nname: gpt-6-1-sol\nmodel: gpt-6.1-sol@high\n---\n");
+    fs.writeFileSync(path.join(agents, "jev-1-13.md"), "---\nname: jev-1-13\nmodel: jev-1.13\n---\n");
+    fs.writeFileSync(path.join(agents, "hand.md"), "---\nname: hand\nmodel: custom-chat\n---\n");
+    await withAdmin(cfg, async ({ port, home, setCfg }) => {
+      fs.writeFileSync(path.join(home, "generated-agents.json"), JSON.stringify({ agents: ["gpt-6-1-sol", "jev-1-13", "missing"] }));
+      const get = async () => {
+        const response = await fetch(`${base()}:${port}/api/mod-options`);
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        assert.doesNotMatch(text, /hidden-credential|hidden-api-key/);
+        return JSON.parse(text) as ModOptions;
+      };
+      const options = await get();
+      assert.deepEqual(options.agents, [{ name: "gpt-6-1-sol", model: "gpt-6.1-sol", provider: "codex", efforts: ["low", "medium", "high", "xhigh", "max"], billing: "subscription" }]);
+      assert.deepEqual(options.providers.map(p => [p.name, p.billing]), [["codex", "subscription"], ["zen", "payg"], ["custom", "free"], ["native", "payg"], ["google", "subscription"]]);
+      assert.deepEqual(options.claudeEfforts, ["low", "medium", "high", "xhigh", "max"]);
+      assert.equal(Object.hasOwn(options, "presets"), false, "the presets are gone: the router fills empty rungs itself");
+      assert.deepEqual(options.models.find(m => m.model === "jev-1.13"), { model: "jev-1.13", provider: "zen", name: "Jev", judgeOnly: true });
+      assert.equal(options.models.length, 6);
+      assert.deepEqual(options.zen, { configured: true, model: "jev-1.13" });
+      assert.equal(options.providers.find(p => p.name === "codex")?.usable, false);
+      assert.equal(options.providers.find(p => p.name === "google")?.usable, false);
+      assert.equal(options.providers.find(p => p.name === "native")?.usable, true);
+      assert.equal(options.scores.attribution, "Data: Artificial Analysis (artificialanalysis.ai)");
+      assert.equal(options.scores.models.find(m => m.model === "gpt-6.1-sol")?.variants[0]?.intelligence, 50.24);
+      assert.equal(refreshed, 1);
+      // ChatGPT out of quota is not connected: an empty Standard rung is filled with Claude, not Sol.
+      const fill = async () => {
+        const saved = await putModSettings(port, { settings: { rules: { general: { mode: "auto", allow: [] } } } });
+        assert.equal(saved.status, 200);
+        const general = ((await saved.json()) as ModSettingsSnapshot).settings.rules.general;
+        return general.mode === "ladder" ? general.rungs : {};
+      };
+      assert.deepEqual((await fill()).standard, [{ target: { agent: "general-purpose", model: "sonnet" }, effort: "medium" }]);
+      credit = true;
+      const credited = await get();
+      assert.equal(credited.providers.find(p => p.name === "codex")?.usable, true, "purchased credits keep a full account usable");
+      assert.deepEqual((await fill()).standard, [{ target: { agent: "gpt-6-1-sol" }, effort: "medium" }]);
+      setCfg(makeCfg({ providers: { zen: { type: "openai-compatible", url: "https://opencode.ai/zen/v1", models: [{ id: "jev-2" }] } }, routes: {}, aliases: {}, direct: [] }));
+      assert.deepEqual((await get()).zen, { configured: true, model: "jev-2" }, "hand-entered Zen URLs need no preset");
+      setCfg(makeCfg({ providers: {}, routes: {}, aliases: {}, direct: [] }));
+      const empty = await get();
+      assert.deepEqual(empty.zen, { configured: false, model: null });
+      assert.deepEqual(empty.models, []);
+      assert.deepEqual(empty.agents, []);
+    }, {
+      agentDir: agents,
+      chatgpt: () => ({ quota: { codex: null }, auth: { codex: "ok" }, refresh: async () => { refreshed++; return { at: Date.now(), ...full }; }, accounts: () => ({ codex: [
+        { id: "ready", label: "Ready", expiresAt: Date.now() + 10000, needsReauth: false, paused: false, source: "own", state: "ready", quota: { ...full, ...(credit ? { credits: { has_credits: true } } : {}) }, active: true },
+        { id: "paused", label: "Paused", expiresAt: Date.now() + 10000, needsReauth: false, paused: true, source: "own", state: "paused", quota: null, active: false },
+      ] }) }),
+      modelScoresFetch: async () => Response.json({ source: "https://artificialanalysis.ai", attribution: "Data: Artificial Analysis (artificialanalysis.ai)", generatedAt: "2026-10-10T00:00:00Z", models: [{ slug: "gpt-6-1-sol-high", base: "gpt-6-1-sol", effort: "high", intelligence: 50.24, costPerTask: 0.3191 }] }),
+    });
+  } finally { fs.rmSync(agents, { recursive: true, force: true }); }
+});
 
 test("admin config saves isolate client settings and restore the caller environment on failure", async () => {
   const outer = fs.mkdtempSync(path.join(os.tmpdir(), "cr-admin-settings-"));
@@ -180,7 +524,7 @@ test("Claude account admin endpoints expose no secrets and rename or remove only
     assert.equal(listed.status, 200);
     const body = await listed.json() as { current: unknown; accounts: { id: string; label: string }[] };
     assert.equal(body.current, null);
-    assert.deepEqual(body.accounts, [{ id: account.id, label: "person@example.test", email: "person@example.test", expiresAt: account.expiresAt, needsReauth: false }]);
+    assert.deepEqual(body.accounts, [{ id: account.id, label: "person@example.test", email: "person@example.test", expiresAt: account.expiresAt, needsReauth: false, preferred: false }]);
     assert.doesNotMatch(JSON.stringify(body), /admin-access-secret|admin-refresh-secret|upstream-account-secret/);
 
     const renamed = await fetch(`${base()}:${port}/api/claude-accounts/${encodeURIComponent(account.id)}`, {
@@ -190,6 +534,18 @@ test("Claude account admin endpoints expose no secrets and rename or remove only
     });
     assert.equal(renamed.status, 200);
     assert.equal(listClaudeAccounts(home)[0]!.label, "Personal");
+
+    const prefer = (preferred: unknown) => fetch(`${base()}:${port}/api/claude-accounts`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preferred }),
+    });
+    assert.equal((await prefer(account.id)).status, 200);
+    assert.equal(listClaudeAccounts(home)[0]!.preferred, true);
+    assert.equal((await prefer("current")).status, 200, "the current login takes first place back by name");
+    assert.equal(listClaudeAccounts(home)[0]!.preferred, false);
+    assert.equal((await prefer("not-a-local-id")).status, 404);
+    assert.equal((await prefer(7)).status, 400);
 
     const current = await fetch(`${base()}:${port}/api/claude-accounts/current`, { method: "DELETE" });
     assert.equal(current.status, 409);
@@ -301,7 +657,7 @@ test("GET /api/claude-models falls back when no picker bootstrap has arrived", a
     assert.equal(res.status, 200);
     const body = (await res.json()) as { source: string; models: { id: string; name: string }[] };
     assert.equal(body.source, "fallback");
-    assert.deepEqual(body.models[0], { id: "claude-fable-5-1", name: "Fable 5.1" });
+    assert.deepEqual(body.models[0], { id: "claude-haiku-5-5", name: "Haiku 5.5" });
   });
 });
 
@@ -384,7 +740,7 @@ test("GET /api/status reports native Anthropic TCP reachability and token-file s
     const res = await fetch(`${base()}:${port}/api/status`);
     assert.equal(res.status, 200);
     const body = await res.json() as { providers: Record<string, { url: string; type: string; reachable: boolean; authSource: string | null }> };
-    assert.deepEqual(Object.keys(body.providers.native ?? {}).sort(), ["accountCount", "authSource", "reachable", "signedIn", "type", "url"]);
+    assert.deepEqual(Object.keys(body.providers.native ?? {}).sort(), ["accountCount", "authSource", "reachable", "signedIn", "type", "url", "usable"]);
     assert.equal(body.providers.native?.url, "https://api.anthropic.com");
     assert.equal(body.providers.native?.type, "anthropic");
     assert.equal(body.providers.native?.authSource, "token-file");
@@ -403,7 +759,7 @@ test("GET /api/effort-levels reports compatible defaults and ChatGPT model excep
     const res = await fetch(`${base()}:${port}/api/effort-levels`);
     assert.equal(res.status, 200);
     const body = await res.json() as { providers: Record<string, { default: string[]; models?: Record<string, string[]> }> };
-    assert.deepEqual(body.providers.anthropic?.default, ["low", "medium", "high", "max"]);
+    assert.deepEqual(body.providers.anthropic?.default, ["low", "medium", "high", "xhigh", "max"]);
     assert.deepEqual(body.providers.openrouter?.default, ["low", "medium", "high"]);
     assert.deepEqual(body.providers.openrouter?.models, { effort: ["low", "medium", "high"], "no-effort": [] });
     assert.deepEqual(body.providers.custom?.default, ["max"]);
@@ -450,6 +806,37 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
   });
 });
 
+test("PUT /api/config carries a webSearch backend through to the file and GET returns it", async () => {
+  await withAdmin(makeCfg(), async ({ port, configFile, setCfg }) => {
+    const next = makeCfg({
+      providers: { gpt: { type: "chatgpt", auth: "own" } },
+      webSearch: { provider: "gpt", model: "gpt-5.6-terra", maxResults: 4 },
+    });
+    const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
+    assert.equal(res.status, 200);
+    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    assert.deepEqual(onDisk.webSearch, next.webSearch);
+    setCfg(next);
+    const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
+    assert.deepEqual(read.webSearch, next.webSearch);
+  });
+});
+
+test("PUT /api/config carries a chatgpt provider's Fast switches through to the file and back", async () => {
+  await withAdmin(makeCfg(), async ({ port, configFile, setCfg }) => {
+    const next = makeCfg({
+      providers: { gpt: { type: "chatgpt", auth: "own", fast: { main: true, subagent: false } } },
+    });
+    const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
+    assert.equal(res.status, 200);
+    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    assert.deepEqual((onDisk.providers.gpt as { fast?: unknown }).fast, { main: true, subagent: false });
+    setCfg(next);
+    const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
+    assert.deepEqual((read.providers.gpt as { fast?: unknown }).fast, { main: true, subagent: false });
+  });
+});
+
 test("PUT /api/config rejects an invalid config with 400 and does not touch the file", async () => {
   const cfg = makeCfg();
   await withAdmin(cfg, async ({ port, configFile }) => {
@@ -474,7 +861,7 @@ test("POST /api/providers/probe accepts native Claude Code auth and reports only
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const missing = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "claude-code" }) });
     assert.deepEqual(await missing.json(), { ok: false, auth: "missing", source: null, signedIn: null, accountCount: 0, models: [
-      { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" },
+      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
     ] });
     saveClaudeAuthFile(home, "test-token", "2026-09-13T00:00:00.000Z");
     const available = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "claude-code" }) });
@@ -483,7 +870,7 @@ test("POST /api/providers/probe accepts native Claude Code auth and reports only
     assert.equal(body.auth, "ok");
     assert.equal(body.source, "token-file");
     assert.equal(body.signedIn, "setup-token");
-    assert.equal(body.models[0]?.id, "claude-fable-5-1");
+    assert.equal(body.models[0]?.id, "claude-haiku-5-5");
     assert.equal(JSON.stringify(body).includes("test-token"), false);
   });
 });
@@ -518,7 +905,7 @@ test("POST /api/providers/probe sends Anthropic API-key headers and treats a mod
   try {
     const res = await fetch(`${base()}:${admin.port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "anthropic", auth: "api-key", apiKey: "secret-key" }) });
     assert.deepEqual(await res.json(), { ok: true, auth: "ok", models: [
-      { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" },
+      { id: "claude-haiku-5-5", name: "Haiku 5.5" }, { id: "claude-sonnet-5-5", name: "Sonnet 5.5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-fable-5-1", name: "Fable 5.1" }, { id: "claude-opus-5", name: "Opus 5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }, { id: "claude-fable-5", name: "Fable 5" }, { id: "claude-opus-4-8", name: "Opus 4.8" }, { id: "claude-opus-4-7", name: "Opus 4.7" }, { id: "claude-sonnet-4-6", name: "Sonnet 4.6" }, { id: "claude-opus-4-6", name: "Opus 4.6" }, { id: "claude-haiku-4-5", name: "Haiku 4.5" },
     ] });
     assert.equal(seen.url, "https://api.anthropic.com/v1/messages");
     assert.equal(seen.headers?.get("x-api-key"), "secret-key");
@@ -666,7 +1053,41 @@ test("POST /api/providers/probe discovers OpenAI-compatible models and probes Ch
     });
     assert.equal(seen.auth, "Bearer secret-key");
     assert.equal(seen.model, "oai-model");
-    assert.equal(seen.tokens, 1);
+    // Above the floor some vendors set (B.ai refuses anything under 3, #57).
+    assert.equal(seen.tokens, 16);
+  } finally {
+    await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
+  }
+});
+
+// A provider entered by hand on the Responses wire may serve nothing else, so its test goes there.
+test("POST /api/providers/probe tests a hand-entered Responses provider on /responses", async () => {
+  const seen: { path?: string | undefined; body?: Record<string, unknown> } = {};
+  const upstream = http.createServer((req, res) => {
+    seen.path = req.url;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      seen.body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      if (req.url === "/v1/responses") res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ output: [] }));
+      else res.writeHead(404).end();
+    });
+  });
+  await new Promise<void>((resolveP) => upstream.listen(0, "127.0.0.1", resolveP));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    await withAdmin(makeCfg(), async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "openai-compatible", url: `http://127.0.0.1:${address.port}/v1/`, wire: "responses", headers: { authorization: "Bearer secret-key" }, probeModel: "resp-model" }),
+      });
+      assert.deepEqual(await res.json(), { ok: true, auth: "ok", models: [] });
+    });
+    assert.equal(seen.path, "/v1/responses");
+    assert.equal(seen.body?.model, "resp-model");
+    assert.equal(seen.body?.input, "hi");
   } finally {
     await new Promise<void>((resolveP, reject) => upstream.close((error) => error ? reject(error) : resolveP()));
   }
@@ -855,6 +1276,75 @@ test("GET /api/requests filters newest records and returns a summary", async () 
   });
 });
 
+test("GET /api/requests takes a comma-separated kind list", async () => {
+  await withAdmin(makeCfg(), async ({ home }) => {
+    const requests = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    requests.add({ id: "turn", at: new Date(Date.now() - 20_000).toISOString(), ms: 150, status: 200, ok: true, kind: "messages", source: "claude", target: "gpt", provider: "chatgpt", stream: true, usage: { input: 20, cached: 0, output: 7 } });
+    requests.add({ id: "count", at: new Date(Date.now() - 10_000).toISOString(), ms: 5, status: 200, ok: true, kind: "count_tokens", source: "claude", target: "gpt", provider: "chatgpt", stream: false });
+    requests.add({ id: "image", at: new Date().toISOString(), ms: 30_000, status: 200, ok: true, kind: "image", source: "gpt-6-astra", target: "image", provider: "gpt", stream: false, usage: { input: 2249, cached: 0, output: 75 }, note: "1536x1024 low png, 1 reference(s)" });
+    const reloaded = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    const cfg = makeCfg({ admin: { port: 0 } });
+    const log = new Logger(null, 1_000_000, 1, false);
+    const extra = await startAdmin({ config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
+    try {
+      const ids = async (query: string): Promise<string[]> =>
+        ((await (await fetch(`${base()}:${extra.port}/api/requests?n=10&${query}`)).json()) as { requests: { id: string }[] }).requests.map((r) => r.id);
+      assert.deepEqual(await ids("kind=messages,image"), ["image", "turn"]);
+      // An unknown entry is ignored, not an error; a list with nothing valid left means no filter.
+      assert.deepEqual(await ids("kind=messages,nonsense"), ["turn"]);
+      assert.deepEqual(await ids("kind=nonsense"), ["image", "count", "turn"]);
+      assert.deepEqual(await ids("kind="), ["image", "count", "turn"]);
+    } finally {
+      extra.close();
+    }
+  });
+});
+
+test("GET /api/requests/summary?from=&to= answers any period from hourly usage", async () => {
+  await withAdmin(makeCfg(), async ({ home }) => {
+    const records = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    records.add({ id: "a", at: "2026-10-20T10:05:00.000Z", ms: 100, status: 200, ok: true, kind: "messages", source: "claude", target: "gpt", provider: "chatgpt", stream: true, usage: { input: 20, cached: 80, output: 7 } });
+    records.add({ id: "b", at: "2026-10-20T12:05:00.000Z", ms: 300, status: 500, ok: false, kind: "messages", source: "claude", target: "gpt", provider: "chatgpt", stream: true, usage: { input: 5, cached: 5, output: 1 } });
+    const reloaded = new RequestLog(path.join(home, "logs", "requests.jsonl"));
+    const cfg = makeCfg({ admin: { port: 0 } });
+    const log = new Logger(null, 1_000_000, 1, false);
+    const extra = await startAdmin({ config: () => cfg, configFile: path.join(home, "extra-config.json"), log, stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }), health: () => 0, version: "test", requests: reloaded });
+    try {
+      const from = Date.parse("2026-10-20T00:00:00.000Z");
+      const to = Date.parse("2026-10-21T00:00:00.000Z");
+      const res = await fetch(`${base()}:${extra.port}/api/requests/summary?from=${from}&to=${to}`);
+      assert.equal(res.status, 200);
+      const body = await res.json() as {
+        total: { count: number; failed: number; input: number };
+        models: { provider: string; model: string }[];
+        earliest: string | null;
+        from: number;
+        to: number;
+      };
+      assert.equal(body.total.count, 2);
+      assert.equal(body.total.failed, 1);
+      assert.equal(body.total.input, 25);
+      assert.deepEqual(body.models.map((m) => m.model), ["gpt"]);
+      assert.equal(body.earliest, "2026-10-20T10:00:00.000Z");
+      assert.equal(body.from, from);
+      assert.equal(body.to, to);
+
+      // Hour granularity: the record's own hour alone.
+      const hourStart = Date.parse("2026-10-20T10:00:00.000Z");
+      const firstHour = await fetch(`${base()}:${extra.port}/api/requests/summary?from=${hourStart}&to=${hourStart + 3_600_000}`);
+      assert.deepEqual(((await firstHour.json()) as { total: { count: number } }).total.count, 1);
+
+      for (const query of ["from=abc", "from=-1&to=0xq", `from=${to + 1}&to=${to}`]) {
+        const bad = await fetch(`${base()}:${extra.port}/api/requests/summary?${query}`);
+        assert.equal(bad.status, 400);
+        assert.ok(typeof ((await bad.json()) as { error?: string }).error === "string");
+      }
+    } finally {
+      extra.close();
+    }
+  });
+});
+
 test("GET /api/logs returns the tail of router.log", async () => {
   await withAdmin(makeCfg(), async ({ port, home }) => {
     const logDir = path.join(home, "logs");
@@ -883,6 +1373,21 @@ test("GET /app.js serves a static file with the right content-type", async () =>
     const res = await fetch(`${base()}:${port}/app.js`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /javascript/);
+  });
+});
+
+test("the dashboard's favicons are served, and /favicon.ico gets the PNG", async () => {
+  await withAdmin(makeCfg(), async ({ port }) => {
+    const svg = await fetch(`${base()}:${port}/favicon.svg`);
+    assert.equal(svg.status, 200);
+    assert.equal(svg.headers.get("content-type"), "image/svg+xml");
+    for (const route of ["/favicon-32.png", "/favicon.ico"]) {
+      const res = await fetch(`${base()}:${port}${route}`);
+      assert.equal(res.status, 200, route);
+      assert.equal(res.headers.get("content-type"), "image/png", route);
+      const bytes = Buffer.from(await res.arrayBuffer());
+      assert.equal(bytes.subarray(1, 4).toString("latin1"), "PNG", route);
+    }
   });
 });
 
@@ -1576,6 +2081,86 @@ test("a model the catalogue describes is measured with one request and takes the
   }, { measureFetch, modelCatalog });
 });
 
+// OpenCode's `/models` reports ids alone, so a model the catalogue lists has no window unless the
+// catalogue's `limit.context` is written in. It goes only into a blank field (the user's stands).
+test("measurement writes the catalogue's context window into a model that has none, and never overwrites one", async () => {
+  const cfg = makeCfg({
+    providers: {
+      "opencode-go": {
+        type: "openai-compatible",
+        url: "https://opencode.ai/zen/go/v1",
+        wire: "responses",
+        preset: "opencode-go",
+        headers: { authorization: "Bearer sk-test" },
+        models: [
+          { id: "muse-spark-1.3-contributor", name: "Muse", contextWindow: 999 },
+          { id: "deepseek-v4.1-flash", name: "DeepSeek" },
+        ],
+      },
+    },
+  });
+  const modelCatalog = async (): Promise<unknown> => ({
+    "opencode-go": {
+      models: {
+        "muse-spark-1.3-contributor": { reasoning: true, reasoning_options: [{ type: "effort", values: ["max"] }], limit: { context: 1048576 } },
+        "deepseek-v4.1-flash": { reasoning: true, reasoning_options: [{ type: "effort", values: ["low", "high"] }], limit: { context: 1000000 } },
+      },
+    },
+  });
+  const measureFetch = async (): Promise<Response> => new Response("{}", { status: 200 });
+  await withAdmin(cfg, async ({ port, configFile }) => {
+    const started = await fetch(`${base()}:${port}/api/providers/measure`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "opencode-go", models: ["muse-spark-1.3-contributor", "deepseek-v4.1-flash"] }),
+    });
+    const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
+    assert.equal(job.state, "done");
+    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 999, "a window already set is not overwritten");
+    assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 1000000);
+  }, { measureFetch, modelCatalog });
+});
+
+// The same window for models already saved: OpenCode's ids-only `/models` left them without one, so
+// they fell back to `cli.autoCompactWindow`. The backfill reaches them once, at start-up.
+test("backfillContextWindows fills only models without a window, leaving a set one alone", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-window-"));
+  try {
+    const cfg = makeCfg({
+      providers: {
+        "opencode-go": {
+          type: "openai-compatible",
+          url: "https://opencode.ai/zen/go/v1",
+          preset: "opencode-go",
+          headers: { authorization: "Bearer sk-test" },
+          models: [
+            { id: "muse-spark-1.3-contributor", name: "Muse" },
+            { id: "deepseek-v4.1-flash", name: "DeepSeek", contextWindow: 123 },
+            { id: "not-listed", name: "Unlisted" },
+          ],
+        },
+      },
+    });
+    const configFile = path.join(home, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+    const lines: string[] = [];
+    const log = new Logger(null, 1_000_000, 1, false);
+    log.info = (msg: string) => { lines.push(msg); };
+    const modelCatalog = async (): Promise<unknown> => ({
+      "opencode-go": { models: { "muse-spark-1.3-contributor": { limit: { context: 1048576 } }, "deepseek-v4.1-flash": { limit: { context: 1000000 } } } },
+    });
+    const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
+    assert.deepEqual(await backfillContextWindows(deps), ["opencode-go/muse-spark-1.3-contributor"]);
+    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 1048576);
+    assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 123, "the vendor's own window stands");
+    assert.equal("contextWindow" in (models.find((m) => m.id === "not-listed") ?? {}), false);
+    assert.ok(lines.some((line) => line === "admin: opencode-go/muse-spark-1.3-contributor context window 1048576 (catalogue)"), `expected the catalogue log line, got ${JSON.stringify(lines)}`);
+    assert.deepEqual(await backfillContextWindows(deps), [], "a second pass finds nothing left to fill");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("a model the plan refuses is still reported when the catalogue lists it", async () => {
   const cfg = makeCfg({
     providers: {
@@ -1752,4 +2337,202 @@ test("an Antigravity provider reads as usable only when an account can answer", 
   assert.deepEqual(googleHealth([account("needs-verification")]), { needsLogin: false, needsVerification: true });
   assert.deepEqual(googleHealth([account("needs-verification"), account("ready")]), { needsLogin: false });
   assert.deepEqual(googleHealth([account("paused")]), { needsLogin: false });
+});
+
+// A provider set up before effort discovery stays without effort until someone saves it again, so
+// the router measures those models itself. Only models whose effort is stripped and unsettled.
+test("measureUnsettledModels: discovers effort for a ladderless provider's unsettled models, and nothing else", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-unsettled-"));
+  try {
+    const cfg = makeCfg({
+      providers: {
+        kimi: { type: "anthropic-compatible", url: "http://127.0.0.1:9", preset: "kimi", models: [{ id: "kimi-k3" }, { id: "kimi-settled", effortLevels: [] }] },
+        // DeepSeek's preset declares low/high/max, which requests already use: nothing to discover.
+        deepseek: { type: "anthropic-compatible", url: "http://127.0.0.1:9", preset: "deepseek", models: [{ id: "deepseek-v4-pro" }] },
+        // The provider form writes `reasoning: "none"` for any OpenAI-compatible provider without a
+        // preset ladder; that is a default, not a decision. This endpoint ignores the field.
+        groq: { type: "openai-compatible", url: "http://127.0.0.1:9/v1", wire: "chat", caps: { reasoning: "none", effortLevels: [] }, models: [{ id: "llama-4" }] },
+        // `reasoning: "effort"` with no levels passes effort through as asked: nothing to discover.
+        relay: { type: "openai-compatible", url: "http://127.0.0.1:9/v1", wire: "chat", caps: { reasoning: "effort", effortLevels: [] }, models: [{ id: "relayed" }] },
+      },
+    });
+    const configFile = path.join(home, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2));
+    const asked = new Set<string>();
+    const measureFetch = stubFetch((_url, body) => {
+      const effort = body.output_config?.effort ?? body.reasoning_effort;
+      if (body.reasoning_effort !== undefined) return 200;
+      return effort === undefined ? 200 : effort === "clauderipple-probe" ? 400 : ["low", "high"].includes(effort) ? 200 : 400;
+    });
+    const deps = {
+      config: () => cfg,
+      configFile,
+      log: new Logger(null, 1_000_000, 1, false),
+      measureFetch: async (url: string, init: RequestInit) => {
+        asked.add(String((JSON.parse(String(init.body)) as { model: string }).model));
+        return measureFetch(url, init);
+      },
+    } as unknown as AdminDeps;
+    assert.equal(measureUnsettledModels(deps), 2, "two jobs: Kimi and Groq");
+    let onDisk: Config | undefined;
+    for (let i = 0; i < 200 && !(onDisk?.providers.kimi?.models?.[0]?.effortLevels && onDisk?.providers.groq?.models?.[0]?.effortLevels); i++) {
+      await new Promise((resolveP) => setTimeout(resolveP, 5));
+      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    }
+    assert.deepEqual(onDisk?.providers.kimi?.models?.[0]?.effortLevels, ["low", "high"], "validated, and these two accepted");
+    assert.deepEqual(onDisk?.providers.kimi?.models?.[1]?.effortLevels, [], "a settled model is left as it was");
+    assert.deepEqual(onDisk?.providers.groq?.models?.[0]?.effortLevels, [], "a field the endpoint ignores is no effort");
+    assert.deepEqual([...asked].sort(), ["kimi-k3", "llama-4"], "not the settled model, DeepSeek or the pass-through relay");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/providers/probe[grok] lists the proxy's models with the headers live traffic sends, and warns", async () => {
+  const grokHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-grok-probe-"));
+  fs.writeFileSync(path.join(grokHomeDir, "auth.json"), JSON.stringify({ "https://auth.x.ai::u": { key: "grok-session-secret", expires_at: new Date(Date.now() + 5 * 3600_000).toISOString() } }));
+  const seen: { url: string; headers: Headers }[] = [];
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "grok", home: grokHomeDir, clientVersion: "1.0.46" }),
+      });
+      const body = (await res.json()) as { ok: boolean; auth: string; models: { id: string; effortLevels?: string[]; contextWindow?: number }[]; modelsSource: string; warning: string };
+      assert.equal(body.ok, true);
+      assert.equal(body.auth, "ok");
+      assert.equal(body.modelsSource, "catalog");
+      assert.deepEqual(body.models, [{ id: "grok-4.7", name: "Grok 4.7", contextWindow: 256000, effortLevels: ["low", "medium", "high", "xhigh"] }]);
+      assert.match(body.warning, /not affiliated with xAI/);
+      assert.doesNotMatch(JSON.stringify(body), /grok-session-secret/);
+    },
+    {
+      probeFetch: async (url, init) => {
+        seen.push({ url, headers: new Headers(init.headers) });
+        return new Response(JSON.stringify({ object: "list", data: [{ id: "grok-4.7", name: "Grok 4.7", context_window: 256000, supports_reasoning_effort: true, reasoning_efforts: [{ value: "xhigh" }, { value: "high" }, { value: "medium" }, { value: "low" }] }] }), { status: 200 });
+      },
+    },
+  );
+  assert.equal(seen[0]!.url, "https://cli-chat-proxy.grok.com/v1/models");
+  assert.equal(seen[0]!.headers.get("authorization"), "Bearer grok-session-secret");
+  assert.equal(seen[0]!.headers.get("x-xai-token-auth"), "xai-grok-cli");
+  assert.equal(seen[0]!.headers.get("x-grok-client-version"), "1.0.46");
+});
+
+test("POST /api/providers/probe[grok]: two probes at once share one CLI refresh", { skip: process.platform === "win32" }, async () => {
+  const grokHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-grok-probe-"));
+  const auth = (key: string, ms: number) => JSON.stringify({ "https://auth.x.ai::u": { key, expires_at: new Date(Date.now() + ms).toISOString() } });
+  fs.writeFileSync(path.join(grokHomeDir, "auth.json"), auth("grok-old", 5 * 60_000));
+  fs.writeFileSync(path.join(grokHomeDir, "fresh.json"), auth("grok-new", 6 * 3600_000));
+  fs.mkdirSync(path.join(grokHomeDir, "bin"));
+  // Plays `grok models` refreshing the session: slow enough for the second probe to arrive meanwhile.
+  fs.writeFileSync(path.join(grokHomeDir, "bin", "grok"), `#!/bin/sh\necho "$1" >> "${grokHomeDir}/runs"\nsleep 0.3\ncp "${grokHomeDir}/fresh.json" "${grokHomeDir}/auth.json"\n`, { mode: 0o755 });
+  const sent: string[] = [];
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      const probe = () => fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "grok", home: grokHomeDir, clientVersion: "1.0.46" }) }).then((res) => res.json() as Promise<{ ok: boolean }>);
+      const results = await Promise.all([probe(), probe()]);
+      assert.deepEqual(results.map((r) => r.ok), [true, true]);
+    },
+    {
+      probeFetch: async (_url, init) => {
+        sent.push(new Headers(init.headers).get("authorization") ?? "");
+        return new Response(JSON.stringify({ object: "list", data: [{ id: "grok-4.7" }] }), { status: 200 });
+      },
+    },
+  );
+  assert.deepEqual(fs.readFileSync(path.join(grokHomeDir, "runs"), "utf8").trim().split("\n"), ["models"], "one CLI run for both probes");
+  assert.deepEqual(sent, ["Bearer grok-new", "Bearer grok-new"]);
+});
+
+test("POST /api/providers/probe[grok] refuses a clientVersion that cannot be a header, before calling anything", async () => {
+  const grokHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-grok-probe-"));
+  fs.writeFileSync(path.join(grokHomeDir, "auth.json"), JSON.stringify({ "https://auth.x.ai::u": { key: "grok-session-secret", expires_at: new Date(Date.now() + 5 * 3600_000).toISOString() } }));
+  let called = false;
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "grok", home: grokHomeDir, clientVersion: "1.0.46\r\nx: y" }) });
+      const body = (await res.json()) as { ok: boolean; error: string };
+      assert.equal(body.ok, false);
+      assert.match(body.error, /clientVersion cannot be sent as a header/);
+    },
+    { probeFetch: async () => { called = true; return new Response("{}", { status: 200 }); } },
+  );
+  assert.equal(called, false);
+});
+
+test("POST /api/providers/probe[grok] without a session says to sign in and calls nothing", async () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "cr-grok-probe-"));
+  let called = false;
+  await withAdmin(
+    makeCfg(),
+    async ({ port }) => {
+      const res = await fetch(`${base()}:${port}/api/providers/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "grok", home: empty, clientVersion: "1.0.46" }) });
+      const body = (await res.json()) as { ok: boolean; auth: string; error: string; modelsSource: string; models: unknown[] };
+      assert.equal(body.ok, false);
+      assert.equal(body.auth, "missing");
+      assert.match(body.error, /grok login/);
+      assert.equal(body.modelsSource, "fallback");
+      assert.ok(body.models.length > 0, "the measured list is still offered");
+    },
+    { probeFetch: async () => { called = true; return new Response("{}", { status: 200 }); } },
+  );
+  assert.equal(called, false);
+});
+
+test("GET /api/limits assembles every readable provider and honours limits:false", async () => {
+  const now = Date.now();
+  const future = Math.floor((now + 3_600_000) / 1000);
+  const cfg = makeCfg({ providers: {
+    anthropic: { type: "anthropic", auth: "claude-code" },
+    chatgpt: { type: "chatgpt" },
+    gem: { type: "google", auth: "antigravity" },
+    go: { type: "openai-compatible", url: "https://opencode.ai/zen/go/v1", preset: "opencode-go" },
+    zen: { type: "openai-compatible", url: "https://opencode.ai/zen/v1" },
+    deepseek: { type: "anthropic-compatible", url: "https://api.deepseek.com/anthropic" },
+    quiet: { type: "chatgpt", limits: false },
+  } });
+  await withAdmin(cfg, async ({ port }) => {
+    const res = await fetch(`${base()}:${port}/api/limits`);
+    const body = (await res.json()) as { providers: { provider: string; type: string; title: string; accounts: { account: number; windows: { kind: string; label?: string; used_percent: number }[] }[] }[] };
+    assert.deepEqual(body.providers.map((p) => p.provider), ["anthropic", "chatgpt", "gem", "go"]);
+    assert.deepEqual(body.providers.map((p) => p.title), ["Claude", "GPT", "Gemini", "Go"]);
+    assert.equal(body.providers[0]!.type, "anthropic");
+    assert.deepEqual(body.providers[0]!.accounts[0]!.windows.map((w) => `${w.kind}${w.label ? ":" + w.label : ""}`), ["five_hour", "seven_day", "scoped:Fable"]);
+    // The paused ChatGPT account takes no number; the ready one is account 0.
+    assert.deepEqual(body.providers[1]!.accounts.map((a) => a.account), [0]);
+    assert.equal(body.providers[2]!.type, "google");
+    assert.equal(body.providers[3]!.type, "opencode-go");
+  }, {
+    claudeUsage: async () => ({ current: { type: "claude.usage", at: now, rate_limits: {
+      primary: { used_percent: 1, window_minutes: 300 },
+      secondary: { used_percent: 88, window_minutes: 10080, reset_at: future },
+    }, scoped: [{ name: "Fable", used_percent: 2, window_minutes: 10080, reset_at: future }] } }),
+    chatgpt: () => ({
+      quota: {}, auth: {},
+      accounts: () => ({
+        chatgpt: [
+          { id: "a", label: "A", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 23, window_minutes: 10080, reset_at: future }, secondary: null } }, active: true },
+          { id: "b", label: "B", paused: true, state: "paused", quota: null, active: false },
+        ] as never,
+        quiet: [{ id: "c", label: "C", paused: false, state: "ready", quota: { at: now, rate_limits: { primary: { used_percent: 5, window_minutes: 10080 } } }, active: false }] as never,
+      }),
+    }),
+    google: () => ({
+      accounts: () => ({ gem: [{ id: "g1", label: "G", paused: false, state: "ready", projectId: "p", expiresAt: now + 3_600_000, needsReauth: false, active: true }] as never }),
+      usage: async () => ({ g1: [{ displayName: "Gemini Models", buckets: [
+        { bucketId: "gemini-weekly", displayName: "Weekly", window: "weekly", resetTime: new Date(future * 1000).toISOString(), remainingFraction: 0.98 },
+        { bucketId: "gemini-5h", displayName: "5h", window: "5h", remainingFraction: 1 },
+      ] }] }),
+    }),
+    opencodeUsage: async (name: string) => name === "go" ? [
+      { kind: "five_hour", used_percent: 3, window_minutes: 300, reset_at: future },
+      { kind: "seven_day", used_percent: 52, window_minutes: 10080, reset_at: future },
+      { kind: "window", used_percent: 92, window_minutes: 43200, reset_at: future },
+    ] : [],
+  });
 });

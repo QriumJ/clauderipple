@@ -11,7 +11,9 @@ import { desktopClaudeCodeDirs, latestDesktopClaude } from "../src/claude-auth.t
 import { configLibraryDir } from "../src/picker.ts";
 
 const cli = path.resolve(import.meta.dirname, "../src/index.ts");
-const notLinux = process.platform !== "linux";
+// A parent can spoof process.platform for cross-platform tests, but execFile starts a native
+// child: on macOS that would run the real launchd installer against the user's live agent.
+const notLinux = os.type() !== "Linux";
 const onWindows = process.platform === "win32";
 
 /** Runs `fn` with XDG_CONFIG_HOME in a scratch dir and a fake `systemctl` first on PATH, then puts everything back. */
@@ -138,7 +140,8 @@ async function freePort(): Promise<number> {
 
 /** Runs `clauderipple install` against scratch state; resolves with the exit code and output. */
 async function runInstall(root: string, settings: string, port: number): Promise<{ code: number; out: string }> {
-  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: path.join(root, "ripple"), CLAUDE_SETTINGS_PATH: settings };
+  if (notLinux) throw new Error("systemd install tests require a Linux host; refusing to touch the native supervisor");
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: path.join(root, "ripple"), CLAUDE_SETTINGS_PATH: settings, CLAUDERIPPLE_LAUNCHER_DIR: path.join(root, "launcher") };
   delete env.NODE_OPTIONS;
   try {
     const r = await promisify(execFile)(process.execPath, [cli, "install", "--port", String(port)], { env, timeout: 60_000 });
@@ -150,6 +153,16 @@ async function runInstall(root: string, settings: string, port: number): Promise
 }
 
 const ORIGINAL_SETTINGS = '{"env":{"KEEP_ME":"keep"},"model":"opus"}\n';
+
+test("a non-Linux host cannot launch the installer even when process.platform is spoofed", { skip: !notLinux }, async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    await assert.rejects(runInstall("/unused", "/unused/settings.json", 1), /require a Linux host/);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
+});
 
 test("no user manager: install fails before registering anything and settings.json is untouched", { skip: notLinux }, () =>
   withFakeSystemd(`process.stderr.write("Failed to connect to bus: No medium found\\n"); process.exit(1);`, async ({ root }) => {

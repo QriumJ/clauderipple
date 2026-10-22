@@ -16,15 +16,19 @@ import { adminPort } from "../../router/src/admin.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
-import { BUNDLE_ID, removeBundle, writeBundle } from "./bundle.ts";
+import { removeBundle, writeBundle } from "./bundle.ts";
+import { nativeSupervisor, registration, writePaths } from "./registration.ts";
+import { installLauncher, uninstallLauncher } from "./launcher.ts";
+import type { RecoveryDeps } from "./doctor.ts";
 import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
 import { runtime } from "./runtime.ts";
 import { codexOff, codexOn } from "./codex.ts";
 import { ingressModels } from "../../router/src/ingress/models.ts";
+import { GROK_DEFAULT_URL } from "../../router/src/providers/grok/catalog.ts";
 import { claudeLogin, claudeLogout, desktopClaudeCodeDirs } from "./claude-auth.ts";
 import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
-import { installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
+import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
 
 function setPickerEnabled(enabled: boolean): void {
@@ -153,9 +157,13 @@ async function image(): Promise<void> {
     ...(images.length ? { images } : {}),
   };
   const port = adminPort(new ConfigStore(configPath()).get());
+  // Claude Code exports its session to Bash commands; the router logs it with the image so the
+  // request list shows which session spent the subscription.
+  const session = process.env.CLAUDE_CODE_SESSION_ID;
+  const headers = { "content-type": "application/json", ...(session && /^[\w-]{1,128}$/.test(session) ? { "x-claude-code-session-id": session } : {}) };
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    res = await fetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers, body: JSON.stringify(body) });
   } catch {
     throw new Error(`the router is not answering on 127.0.0.1:${port}; start it with: clauderipple start`);
   }
@@ -210,43 +218,19 @@ async function install(): Promise<void> {
 
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
-  fs.writeFileSync(
-    path.join(home, "paths.json"),
-    JSON.stringify(
-      {
-        node: installedRuntime.node,
-        env: installedRuntime.env,
-        cli: installedRuntime.cli,
-        router: installedRuntime.router,
-        hookScript: installedRuntime.hookScript,
-        repo: installedRuntime.repo,
-      },
-      null,
-      2,
-    ) + "\n",
-  );
+  writePaths(installedRuntime, home);
+  const shim = dropPowerShellShim(installKind(installedRuntime));
+  if (shim) console.log(`✓ removed ${shim}: PowerShell's default policy refuses it, and clauderipple.cmd runs instead`);
   // Windows and Linux register node + the router script directly (schtasks.ts writes its own .cmd
   // launcher); a macOS source checkout gets a small .app so the agent shows a real name in Login Items.
-  if (installedRuntime.packaged || isWindows || isLinux) {
-    const plist = installAgent({
-      program: installedRuntime.node,
-      args: [installedRuntime.router],
-      bundleId: "com.clauderipple.app",
-      home,
-      env: { ...installedRuntime.env, ...(process.env.CLAUDE_SETTINGS_PATH ? { CLAUDE_SETTINGS_PATH: process.env.CLAUDE_SETTINGS_PATH } : {}) },
-    });
-    console.log(`✓ ${supervisorName()} registered: ${plist}${isLinux ? "" : ' (shows as "ClaudeRipple" in Login Items)'}`);
-  } else {
-    const launcher = writeBundle({ home, node: installedRuntime.node, script: installedRuntime.router, version: VERSION });
+  // registration.ts holds the mapping, so `repair` registers exactly the same thing.
+  const reg = registration(installedRuntime, home, VERSION);
+  if (reg.bundle) {
+    const launcher = writeBundle({ home, node: reg.bundle.node, script: reg.bundle.script, version: reg.bundle.version });
     console.log(`✓ background item bundle written: ${path.dirname(path.dirname(path.dirname(launcher)))} (shows as "ClaudeRipple" in Login Items)`);
-    const plist = installAgent({
-      program: launcher,
-      bundleId: BUNDLE_ID,
-      home,
-      ...(process.env.CLAUDE_SETTINGS_PATH ? { env: { CLAUDE_SETTINGS_PATH: process.env.CLAUDE_SETTINGS_PATH } } : {}),
-    });
-    console.log(`✓ ${supervisorName()} registered: ${plist}`);
   }
+  const plist = installAgent({ program: reg.program, args: reg.args, bundleId: reg.bundleId, home, env: reg.env });
+  console.log(`✓ ${supervisorName()} registered: ${plist}${isLinux || reg.bundle ? "" : ' (shows as "ClaudeRipple" in Login Items)'}`);
 
   // launchd starts the agent the moment it is bootstrapped (RunAtLoad); a scheduled task waits for
   // its logon trigger, so the router would only appear after the next sign-in. Start it either way.
@@ -273,10 +257,26 @@ async function install(): Promise<void> {
   const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {} });
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
+  // Something to double-click for the menu-bar app, which is what offers repair when the router is
+  // down. Never fatal: the router and Claude's settings are already in place.
+  try {
+    const app = installLauncher({ rt: installedRuntime, home, version: VERSION });
+    if (app.paths.length) console.log(`✓ menu-bar app launcher: ${app.paths.join(", ")}`);
+    else if (!app.ok) console.log(`  menu-bar app launcher not written: ${app.detail}`);
+  } catch (e) {
+    console.log(`  menu-bar app launcher not written: ${(e as Error).message}`);
+  }
+  // The phone host has the same problem as the router above: new files, old process. The host
+  // decides whether it is ours and idle (remote host-service refreshPlan). Never fatal.
+  try {
+    execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
+  } catch {
+    console.log("  the phone host was not restarted; if you use it, run: clauderipple remote install");
+  }
   console.log("\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");
 }
 
-function uninstall(): void {
+async function uninstall(): Promise<void> {
   const home = homeDir();
   const cfg = new ConfigStore(configPath()).get();
   // Stop the router before unregistering it. On macOS unloading the agent takes the process with
@@ -284,9 +284,17 @@ function uninstall(): void {
   // so --purge then fails with EPERM and leaves the home directory behind (measured 2026-09-16 in a
   // Windows 11 arm64 VM).
   if (stopAgent()) console.log("✓ router stopped");
+  // Before --purge can take the journal that says whether the router left sleep disabled.
+  await releaseHeldSleep("uninstalled");
   const removed = removeAgent();
   console.log(removed ? `✓ ${supervisorName()} removed (${agentDefinitionPath()})` : `✓ no ${supervisorName()} registered`);
   removeBundle(home);
+  try {
+    const app = uninstallLauncher({ rt: installedRuntime, home, version: VERSION });
+    if (app.paths.length) console.log(`✓ menu-bar app launcher removed (${app.paths.join(", ")})`);
+  } catch (e) {
+    console.log(`  could not remove the menu-bar app launcher: ${(e as Error).message}`);
+  }
   const edit = removeProxyEnv({ proxyUrl: proxyUrlFor(cfg.listen.port), caPath: certPaths(home).caPem });
   console.log(edit.changed ? `✓ ${settingsPath()} restored (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} had no ClaudeRipple keys`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
@@ -327,7 +335,7 @@ async function status(): Promise<void> {
   const p = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream });
   rows.push(["probe", `${p.ok ? "ok" : "FAIL"}: ${p.detail} (${p.ms}ms)`]);
   for (const [name, p2] of Object.entries(cfg.providers)) {
-    const providerUrl = p2.type === "chatgpt" ? (p2.url ?? "https://chatgpt.com") : p2.type === "anthropic" ? "https://api.anthropic.com" : p2.type === "google" ? (p2.url ?? "https://generativelanguage.googleapis.com") : p2.url;
+    const providerUrl = p2.type === "chatgpt" ? (p2.url ?? "https://chatgpt.com") : p2.type === "anthropic" ? "https://api.anthropic.com" : p2.type === "google" ? (p2.url ?? "https://generativelanguage.googleapis.com") : p2.type === "grok" ? (p2.url ?? GROK_DEFAULT_URL) : p2.url;
     const u = new URL(providerUrl);
     rows.push([`provider ${name}`, await tcpCheck(u.hostname, Number(u.port) || (u.protocol === "https:" ? 443 : 80))]);
   }
@@ -449,14 +457,128 @@ async function update(): Promise<void> {
   if (!result.ok) process.exitCode = 1;
 }
 
+// ---- Recovery: doctor, repair, direct, app ------------------------------------------------
+//
+// The menu-bar app calls these when the router is down and the dashboard with it. With --json each
+// prints one JSON object on stdout and exits 0 whatever the diagnosis; a non-zero exit means the
+// command itself could not run.
+
+/** This machine's supervisor, registering this installation's runtime and files. */
+function recoveryDeps(): RecoveryDeps {
+  const home = homeDir();
+  const ops = nativeSupervisor(registration(installedRuntime, home, VERSION), home);
+  return {
+    home,
+    version: VERSION,
+    supervisor: {
+      inspect: () => ops.inspect(),
+      // paths.json is part of what install registers: the GUI and hooks run what it names.
+      register: () => {
+        writePaths(installedRuntime, home);
+        return ops.register();
+      },
+      start: () => ops.start(),
+    },
+  };
+}
+
+function printDoctor(d: Awaited<ReturnType<typeof import("./doctor.ts").doctor>>): void {
+  const sup = d.supervisor;
+  const rows: [string, string][] = [
+    ["mode", d.mode === "ripple" ? "ClaudeRipple" : d.mode === "direct" ? "Claude's default connection (direct)" : "mixed"],
+    ["router", d.router.responding ? `answering${d.router.version ? ` (${d.router.version}${d.router.pid ? `, pid ${d.router.pid}` : ""})` : ""} on ${d.router.url}` : `NOT answering (${d.router.adminUrl})`],
+    [supervisorName(), sup.registered ? `registered · ${sup.state} · ${sup.programExists ? "program ok" : "PROGRAM MISSING"} (${sup.program ?? "-"})` : "NOT registered"],
+    ["claude code", `${d.cli.proxy}${d.cli.url ? ` (${d.cli.url})` : ""}`],
+    ["claude desktop", `${d.desktop.proxy}${d.desktop.url ? ` (${d.desktop.url})` : ""}`],
+  ];
+  const w = Math.max(...rows.map((r) => r[0].length));
+  for (const [k, v] of rows) console.log(`${k.padEnd(w)}  ${v}`);
+  if (d.problems.length === 0) console.log("\n✓ no problems found");
+  else {
+    console.log("\nproblems:");
+    for (const p of d.problems) console.log(`  ✗ ${p.message} [${p.code}]`);
+    console.log("\nFix what can be fixed with: clauderipple repair");
+  }
+}
+
+async function recovery(): Promise<void> {
+  const json = flag("json");
+  const out = (value: object, text: () => void): void => {
+    if (json) console.log(JSON.stringify(value));
+    else {
+      text();
+      if ("ok" in value && value.ok === false) process.exitCode = 1;
+    }
+  };
+  if (cmd === "doctor") {
+    const { doctor } = await import("./doctor.ts");
+    const d = await doctor(recoveryDeps());
+    out(d, () => printDoctor(d));
+    return;
+  }
+  if (cmd === "repair") {
+    const { repair } = await import("./doctor.ts");
+    const r = await repair(recoveryDeps());
+    out(r, () => {
+      for (const s of r.steps) console.log(`${s.ok ? "✓" : "✗"} ${s.name}: ${s.detail}`);
+      console.log("");
+      printDoctor(r.doctor);
+    });
+    return;
+  }
+  if (cmd === "direct") {
+    const sub = args[1];
+    if (sub !== "on" && sub !== "off") throw new Error("usage: clauderipple direct on|off [--force] [--json]");
+    const { directOn, directOff } = await import("./direct.ts");
+    const r = sub === "on" ? directOn(homeDir()) : await directOff(recoveryDeps(), { force: flag("force") });
+    out(r, () => {
+      console.log(`${r.ok ? "✓" : "✗"} ${r.detail}`);
+      if (r.ok) console.log("Quit and reopen Claude Desktop, and start new Claude Code sessions: both read this at start.");
+    });
+    return;
+  }
+  if (cmd === "app") {
+    const install = flag("install");
+    if (install === flag("uninstall")) throw new Error("usage: clauderipple app --install|--uninstall [--json]");
+    const o = { rt: installedRuntime, home: homeDir(), version: VERSION };
+    const r = install ? installLauncher(o) : uninstallLauncher(o);
+    out(r, () => console.log(`${r.ok ? "✓" : "✗"} ${r.detail}${r.paths.length ? `\n  ${r.paths.join("\n  ")}` : ""}`));
+  }
+}
+
+/**
+ * A router that exits leaves the lid-closed sleep bit as it was, for its successor to reconcile
+ * (router awake.ts). When it is stopped for good there is no successor, so clear it here.
+ */
+async function releaseHeldSleep(reason: string): Promise<void> {
+  const { releaseAwake, releaseFailedHint } = await import("./awake-setup.ts");
+  const { execRunner } = await import("../../router/src/awake.ts");
+  const r = await releaseAwake(execRunner(), homeDir(), reason);
+  if (r === "released") console.log(process.platform === "win32" ? "✓ the lid-close action is back to yours (lid-closed awake had set it to Do nothing)" : "✓ sleep re-enabled (lid-closed awake was holding the Mac awake)");
+  if (r === "failed") console.log(`✗ could not re-enable sleep: ${releaseFailedHint()}`);
+}
+
 function help(): void {
   console.log(`clauderipple <command>
 
   install [--port N] [--force] [--max-context-tokens N]
   uninstall [--purge]
   status
+  doctor [--json]   what is wrong with the router, its background service and Claude's connection settings
+  repair [--json]   fix what doctor finds: re-register and start the router, wait for it to answer
+  direct on|off [--force] [--json]
+                    on: use Claude's default connection (Claude Desktop and Claude Code skip ClaudeRipple;
+                    the router stays installed); off: go through ClaudeRipple again. Restart Claude after either.
+  app --install|--uninstall [--json]
+                    a double-clickable launcher for the menu-bar app (~/Applications, Start Menu, app menu)
   start | stop | restart
   logs [-n N] [-f]
+  remote [install|uninstall|status|pair]  run or manage the phone host (macOS, Windows, Linux systemd)
+  remote add <ssh-host> [--port N] [--force]
+                    route Claude Desktop sessions that run on a remote (SSH) host through ClaudeRipple:
+                    sets up the host over your key-based ssh and keeps a reverse tunnel open (remote port, default 18791)
+  remote remove <ssh-host>   undo "remote add" on that host and stop its tunnel
+  remote hosts      list remote (SSH) hosts and their tunnels (also shown by "remote status")
   config            print the config file path
   ui                open the dashboard in your browser
   tray [--install]  start the menu-bar / tray app (--install fetches Electron, ~270MB, once)
@@ -474,20 +596,66 @@ function help(): void {
   agent-title on|off|status
                     prefix subagent titles with the real model and thinking depth ("Terra·high · …") via a Claude Code hook
   mod on|off|status show where each request went above the Claude Code prompt, and the request log in a pane (/ripple-log), via a Claude Code mod
+  awake setup [--ssid <hotspot name>] [--remove]
+                    allow ClaudeRipple to keep the laptop awake with the lid closed (and join that phone hotspot).
+                    macOS: asks for your password once in macOS's own dialog, and removes Insomnia if it is installed;
+                    Windows: no administrator step, only checks (power plan, Wi-Fi adapter, saved hotspot profile)
+  awake on|off|working [--until HH:MM]
+                    working: awake while Claude works and 10 min after; on: always (until HH:MM); off: never
+  tether on|off     join the phone hotspot when Wi-Fi has no internet, and go back to Wi-Fi when a known one works
+  power [--json]    lid-closed awake and hotspot state
 
 Home directory: ${homeDir()}  (override with CLAUDERIPPLE_HOME)`);
 }
 
 try {
   switch (cmd) {
+    case "remote": {
+      const sub = args[1];
+      // Remote (SSH) hosts for Claude Desktop sessions; every other `remote` verb is the phone host's.
+      if (sub === "add" || sub === "remove" || sub === "hosts") {
+        const { remoteAdd, remoteRemove, remoteHosts, REMOTE_SSH_USAGE } = await import("./remote.ts");
+        const host = args[2];
+        if (sub === "hosts") await remoteHosts();
+        else if (!host || host.startsWith("--")) throw new Error(REMOTE_SSH_USAGE);
+        else if (sub === "add") {
+          const port = opt("port");
+          await remoteAdd(host, { ...(port !== undefined ? { port: Number(port) } : {}), force: flag("force") });
+        } else await remoteRemove(host);
+        break;
+      }
+      const script = path.resolve(here, "../../remote/src/main" + path.extname(fileURLToPath(import.meta.url)));
+      const { spawn } = await import("node:child_process");
+      const child = spawn(installedRuntime.node, [script, ...args.slice(1)], { stdio: "inherit", env: { ...process.env, ...installedRuntime.env } });
+      for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => child.kill(signal));
+      process.exitCode = await new Promise<number>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", code => resolve(code ?? 1));
+      });
+      if (sub === "status") {
+        // Only when there are any, so the phone host's status reads exactly as before otherwise.
+        const { configuredHosts, remoteHosts } = await import("./remote.ts");
+        if (configuredHosts(configPath()).length > 0) {
+          console.log("\nremote (SSH) hosts:");
+          await remoteHosts();
+        }
+      }
+      break;
+    }
     case "install":
       await install();
       break;
     case "uninstall":
-      uninstall();
+      await uninstall();
       break;
     case "status":
       await status();
+      break;
+    case "doctor":
+    case "repair":
+    case "direct":
+    case "app":
+      await recovery();
       break;
     case "start": {
       const r = startAgent();
@@ -499,6 +667,7 @@ try {
       break;
     case "stop":
       console.log(stopAgent() ? "stopped (run `clauderipple start` or `install` to bring it back)" : "stop failed (not loaded?)");
+      await releaseHeldSleep("router stopped");
       break;
     case "logs":
       logs();
@@ -629,6 +798,24 @@ try {
     case "image":
       await image();
       break;
+    case "power":
+    case "awake":
+    case "tether": {
+      const { powerCli, adminPowerCall } = await import("./power.ts");
+      const { defaultSetupDeps } = await import("./awake-setup.ts");
+      const { execRunner } = await import("../../router/src/awake.ts");
+      const run = execRunner();
+      process.exitCode = await powerCli(args, {
+        call: adminPowerCall(adminPort(new ConfigStore(configPath()).get())),
+        configFile: configPath(),
+        rippleHome: homeDir(),
+        run,
+        setupDeps: () => defaultSetupDeps(run, homeDir()),
+        print: (line) => console.log(line),
+        now: () => new Date(),
+      });
+      break;
+    }
     case "ui":
       ui();
       break;
@@ -636,7 +823,9 @@ try {
       await update();
       break;
     case "tray": {
-      const result = args.includes("--install") ? installTrayRuntime() : startTray();
+      // --ensure is what the app launcher runs: fetch Electron once if it is missing, then start.
+      const ensured = args.includes("--ensure") && !installedRuntime.packaged ? installTrayRuntime() : null;
+      const result = args.includes("--install") ? installTrayRuntime() : ensured && !ensured.ok ? ensured : await startTray();
       console.log(result.message);
       if (!result.ok) process.exit(1);
       break;

@@ -1,16 +1,26 @@
 <p align="center">
-  <img src="docs/media/icon.png" width="128" alt="ClaudeRipple">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="brand/mark.svg">
+    <img src="brand/mark.svg" width="120" height="120" alt="ClaudeRipple 마스코트 리플이: 속이 빈 파문 고리에 물마루가 말려 오른 모습">
+  </picture>
 </p>
 
 <h1 align="center">ClaudeRipple</h1>
 
-<p align="center"><a href="README.md">English</a> · <b>한국어</b></p>
+<p align="center"><a href="README.md">English</a> · <b>한국어</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português (BR)</a></p>
 
 <p align="center">
   <b>채팅은 Claude 그대로. Code만 GPT로.</b><br>
   Claude Desktop의 타모델 설정은 <b>앱 전체</b>를 바꿔 버립니다. 채팅도, 폰 원격 조종도, 커넥터도 같이 사라집니다.<br>
   ClaudeRipple은 아무것도 끄지 않습니다. Claude 구독에 로그인한 그대로 두고, <b>Code 탭</b>에서만
   GPT·DeepSeek·Kimi·Grok 등<br>400여 모델이 답합니다. <b>Codex 앱</b>과 <b>Codex CLI</b>에서는 반대로 Claude를 씁니다.
+</p>
+
+<p align="center">
+  <a href="https://apps.apple.com/kr/app/id6823063731"><img height="40" alt="App Store" src="https://img.shields.io/badge/App%20Store-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-0D96F6?style=for-the-badge&logo=apple&logoColor=white"></a>
+  <img height="40" alt="Google Play" src="https://img.shields.io/badge/Google%20Play-%EC%A4%80%EB%B9%84%20%EC%A4%91-666666?style=for-the-badge&logo=googleplay&logoColor=white">
+  <a href="https://discord.gg/R8ZgGSNHjw"><img height="40" alt="Discord" src="https://img.shields.io/badge/Discord-%EC%B0%B8%EC%97%AC%ED%95%98%EA%B8%B0-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -25,16 +35,24 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/tour.png" width="880" alt="ClaudeRipple 설정 화면: 상태, 모델 매핑, 프로바이더, 클라이언트, 요청 로그">
+  <a href="https://github.com/PBJ-2/clauderipple/releases/download/v0.9.0/clauderipple-demo.mp4"><img src="docs/media/demo.webp" width="880" alt="1분 둘러보기: Claude Desktop의 모델 메뉴에 다른 모델이 들어가고, 프롬프트마다 추론 강도를 정하고, 서브에이전트는 맞는 모델로 보냅니다. 누르면 전체 영상이 열립니다."></a><br>
+  <sub>1분 둘러보기: Claude Desktop의 모델 메뉴에 다른 모델이 들어가고, 프롬프트마다 추론 강도를 정하고, 서브에이전트는 맞는 모델로 보냅니다. 누르면 전체 영상이 열립니다.</sub>
 </p>
 
 <table align="center">
   <tr>
-    <td align="center" width="34%"><img src="docs/media/picker-zoom.png" width="300" alt="Claude Desktop 피커에 실제 이름으로"><br><sub>Claude Desktop 피커에 GPT 모델이 실제 이름으로</sub></td>
-    <td align="center" width="66%"><img src="docs/media/luna-answer.png" alt="Code 탭에서 답하는 GPT-5.6 Luna"><br><sub>Code 탭에서 고른 추론 강도 그대로 답하는 GPT-5.6 Luna</sub></td>
+    <td align="center" width="34%"><img src="docs/media/picker.png" width="300" alt="Claude Desktop의 원래 모델 메뉴에 GPT·DeepSeek·GLM·Gemini"><br><sub>Claude Desktop의 원래 모델 메뉴에 GPT·DeepSeek·GLM·Gemini</sub></td>
+    <td align="center" width="66%"><img src="docs/media/answer.png" alt="Code 탭에서 일하는 GPT-6 Astra, 오른쪽에는 모든 요청 기록"><br><sub>Code 탭에서 일하는 GPT-6 Astra, 오른쪽에는 모든 요청 기록</sub></td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><img src="docs/media/subagents.png" alt="백그라운드 작업 패널에 실제 모델 이름으로 표시된 서브에이전트"><br><sub>GPT-5.6 Terra·Sol로 도는 서브에이전트, 작업 패널에 실제 이름으로</sub></td>
+    <td colspan="2" align="center"><img src="docs/media/subagents.png" alt="DeepSeek·GLM으로 도는 서브에이전트, 작업 패널에 실제 이름으로"><br><sub>DeepSeek·GLM으로 도는 서브에이전트, 작업 패널에 실제 이름으로</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/media/mod-band.png" alt="리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률"><br><sub>리플 모드: 추론 강도, 컨텍스트, 캐시 타이머, 실제로 답한 모델과 캐시 적중률</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="docs/media/mod-alerts.png" alt="캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계"><br><sub>캐시가 식거나 한도가 가까우면 경고, 새 대화로 인수인계</sub></td>
+    <td align="center" width="50%"><img src="docs/media/mod-settings.png" alt="빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드"><br><sub>빠른 설정: 자동 추론 강도, 판정 모델, 워커 모드</sub></td>
   </tr>
 </table>
 
@@ -101,7 +119,9 @@ Anthropic이 만든 커넥터가 전부 그대로 동작합니다. 1P에 남는 
 
 ### OpenAI API 키가 필요한가요?
 
-필요 없습니다. ChatGPT Plus나 Pro 구독이면 됩니다. 앱에서 로그인하면 되고 API 키는 쓰지 않습니다.
+필요 없습니다. Codex가 포함된 ChatGPT 요금제면 됩니다 — Plus·Pro·Business, 그리고 워크스페이스 관리자가
+Codex를 켜 둔 Enterprise·Edu. 앱에서 로그인하면 되고 API 키는 쓰지 않습니다. 사용량 한도는 요금제 것을 따르며,
+한도를 다 쓰면 구매해 둔 Codex 크레딧으로 이어서 씁니다.
 API 키는 DeepSeek·Kimi·GLM·OpenRouter처럼 다른 프로바이더를 붙일 때만 씁니다.
 
 ### 어떤 모델을 쓸 수 있나요?
@@ -235,20 +255,55 @@ ClaudeRipple은 Claude Code 프로세스만 신뢰하는 작은 HTTPS 프록시�
   서버 측 스레드 처리, 도구 호출과 이미지 왕복, 모델이 받는 범위로 추론 강도 클램프, 호환 벤더에는 Anthropic 전용 필드 제거.
 - **제대로 된 요청 로그.** 누가 물었고 어떤 모델이 답했는지, 입력·캐시·출력 토큰, 지연, 상태를 요청마다. 한 시간 요약 포함.
 - **서브에이전트 이름표.** 백그라운드 작업 패널에 "Agent" 대신 `Terra·high · Review`가 보입니다.
-- **입력창에서 보이는 경로.** Claude Code mod가 입력창 위에 한 줄을 띄웁니다. 마지막 요청이 어디로 갔는지, 추론 강도·캐시
-  적중률·시간까지. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 프로바이더·결과별 색으로 띄우고, `×`(또는
-  `/ripple-bar`)로 줄을 숨깁니다. 같은 mod가 Agent 호출에 다른 모델이 붙어도 워커를 제 모델로 돌리고,
-  `[[ripple: 이름@강도]]` 표식을 프롬프트 어디에 두든 읽습니다. 클라이언트 화면의 스위치 하나, 또는 `clauderipple mod on`.
+- **입력창 위의 리플 모드.** 띠 하나에 추론 강도, 컨텍스트, 캐시 타이머, 마지막 요청에 실제로 답한 모델과 캐시
+  적중률이 보입니다. 작은 판정 모델(Haiku 5.5 또는 Jev)이 프롬프트마다 최근 대화와 함께 읽고 low부터 max까지 추론
+  강도를 정합니다. 맡긴 일은 `ripple:auto`로 가고, 판정 모델이 난이도에 따라 워커를 고릅니다. 가벼운 일은 DeepSeek·GLM,
+  어려운 일은 GPT·Opus로. 캐시가 식었을 때, 컨텍스트가 무거워졌을 때, 요금제 한도가 80%를 넘었을 때 카드로 알려 주고,
+  압축이나 같은 폴더 새 세션으로의 인수인계를 제안합니다. `Log`(또는 `/ripple-log`)로 요청 로그를 옆 패널에 엽니다.
+  클라이언트 화면의 스위치 하나, 또는 `clauderipple mod on`.
 - **ChatGPT 구독으로 이미지 생성.** `clauderipple image "<프롬프트>"`. 참고 이미지와 투명 배경도 됩니다. 서브에이전트에도
   방법이 적혀 있어, GPT나 DeepSeek 워커가 이미지 도구 없이 이미지를 만들고 직접 확인합니다.
+- **노트북을 덮어도 Claude는 계속 일합니다.** macOS와 Windows에서 Claude가 일하는 동안(끝난 뒤 10분까지)
+  덮개를 닫아도 노트북이 잠들지 않아, 휴대폰으로 맡긴 일이 끝까지 갑니다. 와이파이에서 인터넷이 끊기면 휴대폰
+  핫스팟(아이폰·안드로이드)으로 옮겼다가 나중에 아는 와이파이로 돌아옵니다. 대시보드의 노트북 관리 화면에서
+  켜기 전까지는 꺼져 있습니다. [노트북 덮개와 휴대폰 핫스팟](#노트북-덮개와-휴대폰-핫스팟)을 보세요.
 - **원하면 가벼운 워커.** 스위치 하나로, 생성된 서브에이전트에 세션의 MCP·플러그인 도구 전부 대신 워커가 쓰는 도구만
   줍니다. 워커 첫 요청이 3.3만에서 0.9만 토큰으로 줄었습니다.
 - **터미널이 싫은 사람을 위해.** 원클릭 연결 확인과 모델 자동 검색이 붙은 프로바이더 프리셋, 드롭다운 모델 매핑, 자동 저장,
-  한국어·영어 UI. 런타임을 품고 첫 실행에 스스로 설치하는 메뉴 막대 앱. 서명·공증 완료.
+  한국어·영어·중국어·일본어·스페인어·포르투갈어 UI. 런타임을 품고 첫 실행에 스스로 설치하는 메뉴 막대 앱. 서명·공증 완료.
 
 <p align="center">
   <img src="docs/media/mapping.png" width="880" alt="모델 매핑: Claude 이름마다 실제로 답할 모델과 추론 강도">
 </p>
+
+## Ripple Remote: 어떤 모델이든, 휴대폰으로, 몇 시간이고
+
+Claude 데스크톱 앱에 일을 맡기고, 노트북을 덮고, 소파에서 이어서 지시하세요.
+**Ripple Remote**는 ClaudeRipple의 휴대폰 앱입니다. 어떤 모델이 돌리는 세션이든 휴대폰에서 그대로 다루고,
+30분이 지나도 연결이 끊기지 않습니다.
+
+<p align="center">
+  <img src="docs/media/remote/store/ko-1.png" width="260" alt="끊기지 않는 원격: 1시간 47분째 이어지는 GPT 세션">
+  <img src="docs/media/remote/store/ko-2.png" width="260" alt="휴대폰의 모델 선택기 하나에 GPT·DeepSeek·Gemini">
+  <img src="docs/media/remote/store/ko-3.png" width="260" alt="DeepSeek 세션의 요청을 휴대폰에서 승인">
+</p>
+
+- **몇 분이 아니라 몇 시간.** 컴퓨터가 켜져 있는 동안 연결이 유지됩니다. 두 시간짜리 리팩터링도 끝까지
+  지켜보고, 승인을 물으면 그 자리에서 답하세요.
+- **모델을 가리지 않습니다.** GPT·DeepSeek·Gemini·Claude, 어떤 세션이든 똑같이 보이고 똑같이 다룹니다.
+  다음 턴의 모델과 추론 강도도 휴대폰에서 바꿉니다.
+- **Claude 앱 세션 그대로.** Mac의 Code 탭에서 시작한 세션이 휴대폰에서 이어집니다. 실시간 타임라인, 도구 실행,
+  diff, 하위 에이전트와 그 모델, 계획 승인과 질문 카드, 사진·파일 첨부까지.
+- **Mac의 상태 표시줄을 주머니에.** 응답한 모델, 캐시, 사용 한도를 Mac의 ClaudeRipple 띠와 똑같이 보여 줍니다.
+- **노트북 기능과 짝을 이룹니다.** [노트북 덮개와 휴대폰 핫스팟](#노트북-덮개와-휴대폰-핫스팟)을 켜 두면
+  노트북은 가방 안에서도 일하고, 와이파이가 끊겨도 온라인을 유지합니다.
+- **처음부터 비공개.** 메시지·첨부·알림은 종단간 암호화되어 중계 서버도 푸시 서비스도 읽지 못합니다.
+  회원가입·광고·추적 없음, 무료.
+
+컴퓨터에 ClaudeRipple을 설치하고 대시보드의 **휴대폰** 화면에서 QR 코드를 한 번 스캔하면 끝입니다.
+아이폰: [App Store](https://apps.apple.com/kr/app/id6823063731). 안드로이드: Google Play 비공개 테스트 중이며
+[디스코드](https://discord.gg/R8ZgGSNHjw)에서 신청받습니다. Claude 앱 세션 연동은 macOS에서 되고,
+컴퓨터 없이도 앱 안의 데모로 먼저 써 볼 수 있습니다.
 
 ## 설치
 
@@ -287,6 +342,11 @@ npm install -g clauderipple
 clauderipple install
 ```
 
+Windows PowerShell은 기본 실행 정책 때문에 npm이 만든 `clauderipple.ps1`을 실행하지 않습니다. 그래서
+PowerShell에서는 `clauderipple.cmd install`로 실행하십시오(명령 프롬프트에서는 그대로 됩니다). `install`이
+그 파일을 지우므로, 그다음부터는 PowerShell에서도 `clauderipple`만 입력하면 됩니다. 설치 스크립트로 설치하면
+이 파일이 남지 않습니다.
+
 그다음 대시보드를 열어 프로바이더를 추가합니다.
 
 ```sh
@@ -295,14 +355,15 @@ clauderipple ui
 
 **프로바이더** → ChatGPT 추가 또는 API 키 붙여 넣기 → **모델 매핑**.
 
-**메뉴 막대·트레이 앱은 선택 사항입니다.** 라우터 상태를 보여주고 한 번에 대시보드를 엽니다.
+**메뉴 막대·트레이 앱**은 라우터 상태를 보여주고, 한 번에 대시보드를 열고, 라우터가 죽어도 열리는 복구 화면을 갖고 있습니다.
 
 ```sh
 clauderipple tray
 ```
 
-Electron으로 도는데 용량이 270MB라 기본 설치에는 넣지 않았습니다. `clauderipple tray --install`이 한 번만
-받아 옵니다. 나머지 기능은 Electron 없이도 다 돕니다.
+macOS와 Windows에서는 설치 스크립트가 기본으로 함께 설치합니다. Electron으로 돌아 약 270MB이고 한 번만 받습니다.
+빼고 싶으면 설치 명령 앞에 `CLAUDERIPPLE_NO_TRAY=1`을 붙이세요. Linux나 npm으로만 설치했다면
+`clauderipple tray --install`로 추가합니다. 나머지 기능은 앱 없이도 다 돕니다.
 
 **업데이트.** 새 버전이 나오면 트레이가 알려 줍니다(**업데이트 확인…**). 터미널에서는:
 
@@ -419,7 +480,7 @@ codex --profile clauderipple -m claude-sonnet-5
 
 Claude 모델이 Codex 모델 목록에 이름 그대로 뜹니다(ClaudeRipple이 Codex 자체 카탈로그 옆에 모델 카탈로그를 씁니다).
 Claude는 Claude Code 로그인(실행 중인 Desktop 세션, 터미널 로그인, 또는 ClaudeRipple 자체 로그인 — **프로바이더 →
-Claude → Claude 구독 연결…**을 누르면 브라우저가 열리고 터미널은 필요 없습니다. `clauderipple claude-login`과 같습니다)이나
+Claude (Anthropic) → + Claude 계정 추가**를 누르면 브라우저가 열리고 터미널은 필요 없습니다. `clauderipple claude-login`과 같습니다)이나
 Anthropic API 키로 갑니다. 구독 로그인 재사용은 Anthropic 약관의 적용을 받습니다. 설정한 Anthropic 호환 프로바이더도
 같은 방식으로 쓸 수 있습니다.
 
@@ -427,12 +488,40 @@ Anthropic API 키로 갑니다. 구독 로그인 재사용은 Anthropic 약관�
   <img src="docs/media/add-provider.png" width="880" alt="프로바이더 추가: ChatGPT 구독, 프리셋, OpenAI 호환 프로바이더">
 </p>
 
+## 노트북 덮개와 휴대폰 핫스팟
+
+휴대폰으로 돌리는 세션(Remote Control, Ripple Remote)을 위한 기능입니다. 노트북을 가방에 넣어도 일이 이어집니다.
+대시보드의 **노트북 관리** 화면에서 켭니다.
+
+**덮개를 닫아도 잠들지 않게.** 모드는 셋입니다. *끔*, *일할 때만*(모델 요청이 도는 동안과 마지막 요청 뒤 10분),
+*계속 켜 두기*(끄거나 정한 시각까지). 배터리가 20% 아래로 내려가거나 (macOS에서) 맥이 과열 경고를 내면 스스로
+멈추고, 덮개가 닫혀 있으면 노트북을 재웁니다. 깨어 있는 동안 막힌 가방에 오래 넣어 두지는 마세요.
+
+- macOS: **설정하기**를 한 번 누릅니다. macOS 자체 암호 창이 쓰는 명령(`pmset disablesleep`, `pmset sleepnow`,
+  정해 둔 핫스팟 접속)만 허용하는 sudoers 규칙을 설치하며, ClaudeRipple은 암호를 보지 않습니다.
+  `clauderipple awake setup --remove`로 지웁니다. Insomnia가 깔려 있으면 같은 일을 하므로 설정할 때 정리합니다.
+- Windows: 관리자 권한이 필요 없습니다. 라우터의 자식 프로세스가 `SetThreadExecutionState`를 잡고, 그동안만
+  덮개 동작을 "아무것도 안 함"으로 둡니다. 원래 전원 설정은 라우터가 죽어도 되돌아옵니다.
+
+**인터넷 안 되는 와이파이 → 휴대폰 핫스팟.** 와이파이 인터페이스로 실제 인터넷을 확인합니다(업링크가 죽은 공유기나
+로그인 페이지가 뜨는 와이파이도 OS에는 "연결됨"으로 보이기 때문입니다). 5번 중 3번 실패하면 정해 둔 핫스팟에
+붙습니다. 핫스팟에 붙은 뒤 5·10·20·30·40·50·60분에, 그다음엔 10분마다 돌아가기를 시도합니다. 핫스팟에서 잠깐
+나와 OS가 범위 안의 아는 와이파이에 붙게 하고, 그 와이파이에서 인터넷이 될 때만 머뭅니다. 전환하는 순간
+시작된 모델 요청은 실패하지 않고 잠깐 기다립니다.
+
+- 노트북에서 휴대폰 핫스팟에 한 번 직접 접속해 두세요. 그래야 OS가 암호를 기억합니다.
+- 아이폰: 설정 › 개인용 핫스팟 › '다른 사람의 연결 허용'을 켜 두세요. 맥이라면 같은 Apple 계정과 블루투스가
+  있으면 더 잘 찾습니다.
+- 안드로이드: 아무도 안 붙어 있으면 핫스팟이 잠시 뒤 스스로 꺼집니다. 못 찾으면 다시 켜 주세요.
+- Linux: 아직 지원하지 않습니다.
+
 ## 프로바이더
 
 | 프로바이더 | 종류 | 인증 | 모델 목록 | 비고 |
 |---|---|---|---|---|
 | ChatGPT 구독 | Codex 백엔드 | 로그인 여러 개, 한도 차면 자동 전환(Codex 로그인도 재사용) | 구독에서 자동으로 읽음(GPT-6 Sol·Luna·Astra, GPT-5.6 …) | 추론 강도 low…max(Luna는 ultra), 프롬프트 캐시 94~99 % |
 | Google Gemini | Gemini API | AI Studio API 키, 또는 Google 계정 로그인(Antigravity, 위 FAQ 참고) | 자동 검색 | 번역(Messages ⇄ generateContent), 턴 사이 thought signature 유지 |
+| Grok 구독 | Grok CLI 채팅 프록시 | Grok CLI 로그인(`grok login`), 갱신은 CLI가 함 | 구독에서 자동으로 읽음(Grok 4.7, 4.7 Fast, 4.6, 4.5) | 번역(Chat Completions), 추론 강도 low…xhigh. 공개 API가 아닌 CLI 전용 채널([§4e](docs/ARCHITECTURE.md#4e-grok-providers-implemented-2026-10-08)) |
 | OpenRouter | Anthropic 호환 | API 키 | 400+, 자동 검색 | 모델별 추론 강도 지원을 API에서 읽음 |
 | DeepSeek, Kimi, Z.ai GLM, MiniMax, Qwen(국제/중국) | Anthropic 호환 | API 키 | 프리셋 | 벤더 공식 문서로 확인 |
 | xAI Grok, Mistral, Groq, Together, Fireworks | OpenAI 호환 | API 키 | 자동 검색 | 번역(Chat Completions / Responses) |
@@ -483,6 +572,10 @@ Codex 앱 / CLI ──/v1/responses──▶ ClaudeRipple 입구 ──▶ Claud
 - 피커에 추가한 모델은 다음 세션부터 쓸 수 있습니다.
 - Claude Code와 Codex는 통신 규약을 자주 바꿉니다. 클라이언트 업데이트가 번역을 깨뜨리면 ClaudeRipple이 따라잡을 때까지
   안 될 수 있습니다. 버그와 로그를 환영합니다.
+
+## 커뮤니티
+
+질문, 버그 제보, Ripple Remote 안드로이드 베타(Google Play 비공개 테스트) 신청은 디스코드에서 받습니다: [https://discord.gg/R8ZgGSNHjw](https://discord.gg/R8ZgGSNHjw). 안드로이드 베타에 참여하려면 Google Play에서 쓰는 Gmail 주소를 @pbj_ripple에게 DM으로 보내 주세요. 모두가 읽는 채널에는 올리지 마세요.
 
 ## 비제휴
 

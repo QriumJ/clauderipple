@@ -107,6 +107,7 @@ test("API key path keeps instructions as the system prompt; effort dropped for m
   assert.equal((out.messages[0]!.content as unknown[]).length, 1);
   assert.equal(claudeSupportsEffort("claude-opus-4-6"), true);
   assert.equal(claudeSupportsEffort("claude-fable-5-1"), true);
+  assert.equal(claudeSupportsEffort("claude-mythos-5-1"), true);
   assert.equal(claudeSupportsEffort("claude-sonnet-4-5-20250929"), false);
 });
 

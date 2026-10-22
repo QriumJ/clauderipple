@@ -1,4 +1,198 @@
-# 인수인계 — 2026-09-20 (최신)
+# 인수인계 — 2026-10-22 (최신)
+
+## ▶ 2026-10-22 새벽 — 0.12.2 · 0.12.3 · 0.12.4 게시, 이슈 #69 · #70 · #71 수정
+
+**상태:** 전부 커밋·push·npm 게시 완료(최신 `clauderipple@0.12.4`). 마지막 검증: typecheck 통과,
+`npm test` 1491개(1488 통과, 3 skip, 0 실패), 릴리스마다 격리 설치 확인(대시보드 200, 버전 일치).
+주군 라우터는 아직 **0.12.1**(자동 업데이트 12시간 주기, 다음 점검 때 0.12.4로 올라감 — 손으로 재시작하지 않았다).
+
+**10-22 오전 후속:** 주군 승인으로 #69·#70·#71 답글 게시 후 닫음(#70엔 "업데이트 뒤 `clauderipple remote install`" 추가),
+#54는 스위치로 대신한다고 답하고 not planned로 닫음. 주군 라우터 `clauderipple update`로 0.12.4, 워커 1회로
+`requests.jsonl`에 `"subagent":true` 찍힘 확인(실측) → 아래 1·2번 끝. 5번 파일은 정체 확인 후 정리(설치 스크립트 = 10-20 주군 승인
+"트레이 앱 기본 설치"의 미완분, 루트 HANDOFF.md = 아래 10-19 절로 옮김).
+원격 호스트 재시작 구멍(업데이트 후에도 옛 코드로 돎)은 `install` 끝에 `remote refresh`를 붙여 고쳤다. #75·#76 병합, #72·#73엔 수정 요청 리뷰(키 막힘 상속·402 분류·릴레이 403 키 이동·legacy 대기 해제). 이것들과 트레이 기본 설치를 묶어 **0.12.5 게시**(Actions 성공, npm 확인). 주군 라우터는 0.12.4 — 자동 업데이트가 올린다.
+
+### 일어나서 검토할 것 (순서대로)
+1. **이슈 답글 승인** — 외부 게시라 올리지 않았다. 아래 초안을 승인하시면 올린다.
+   - #69: "0.12.3에서 ChatGPT 프로바이더 설정에 '메인 세션 Fast' / '서브에이전트 Fast' 스위치를 추가했습니다. Claude Code는 GPT
+     모델 요청에 Fast를 붙이지 않기 때문에, 켜 두면 라우터가 해당 요청을 Codex 빠른 등급으로 보냅니다. 대시보드 → 프로바이더 →
+     ChatGPT → 수정에서 켤 수 있습니다."
+   - #71: "0.12.3에서 Claude Code CLI 로그인이 없으면 `clauderipple doctor`와 `clauderipple remote install`이 경고하고 로그인
+     방법을 안내하며, 휴대폰에도 원문 오류 대신 안내 문구가 표시됩니다. 원격 호스트는 Claude 앱이 아니라 CLI 자체 로그인을 쓰므로,
+     말씀하신 우회(앱 내장 `claude.exe`로 `/login` 한 번)가 정확한 해결입니다."
+   - #70: "0.12.4에서 Windows에서도 Claude 앱에 열린 세션으로 휴대폰에서 보낼 수 있습니다. Claude 앱 설정에서 Remote Control을
+     켠 뒤 연 세션이어야 합니다(켜기 전 세션에는 연결 정보가 없습니다). 분석해 주신 내용이 큰 도움이 됐습니다. 다만 새 세션은 실행
+     인자에 세션 id가 없어서, 실행 인자 대신 세션 레지스트리와 프로세스 시작 시각(FILETIME)으로 확인하도록 했습니다."
+2. **서브에이전트 표식 실측** — 라우터가 0.12.3 이상으로 올라간 뒤, 워커를 하나 띄우고
+   `~/.clauderipple/logs/requests.jsonl`에 `"subagent":true`가 찍히는지 본다. 이 표식(`x-claude-code-agent-id`)은 CLI 2.1.304
+   바이너리에서 찾은 것이고 **실제 수신은 아직 측정 전**이다. 안 찍히면 "서브에이전트 Fast"는 동작하지 않는다(메인으로 취급됨).
+3. **GPT Fast 스위치를 켤지** — 기본은 둘 다 꺼짐. 켜면 Codex 빠른 등급으로 가고 구독 사용량이 더 빨리 준다.
+4. **#70 휴대폰 실기 확인(선택)** — VM에서 브리지 전송까지는 확인했다(아래). 휴대폰 → 릴레이 → Windows 호스트 구간은 OS와
+   무관한 기존 경로라 따로 시험하지 않았다. 원하시면 VM에 원격 호스트를 깔고 휴대폰을 페어링해 끝까지 본다.
+5. **의도 불명 미커밋 파일** — `scripts/install.sh`·`scripts/install.ps1` 수정, 루트 `HANDOFF.md`(10-19), `design-drafts/`,
+   `.claude/`는 이 세션 작업이 아니어서 손대지 않았다.
+6. **전역 CLAUDE.md 워커 절 축소** — 공통 내용은 `ripple:auto` 설명문으로 옮기고 주군 개인 규칙만 남겼다. 고치기 전 원본은
+   `~/.claude/CLAUDE.md.bak-20261022`. 괜찮으면 지우셔도 된다.
+7. **Parallels VM "Windows 11"은 켜 둔 채** — 주군이 Claude 앱에 로그인해 Remote Control을 켠 상태 그대로다. 필요 없으면 끄셔도 된다.
+
+### 이 세션에서 한 일
+- **0.12.2** (`3b6bed4`): 테더링 복귀는 아는 Wi-Fi가 잡힐 때만(`50301f5`, 전 세션 작업). `ripple:auto` 설명문 보강 —
+  `[[ripple: opus@high]]`처럼 모델을 적으면 판정·칸 배정·모드를 모두 건너뛰고 그 모델로 돈다는 것(`2ad21d6`, 실측: `opus@low` →
+  `claude-opus-5-5`, `by:"marker"`), 브리핑 요건·보고 확인·5분 안 이어 쓰기(`a3fa930`). 계기: 레드팀 7개가 리플을 우회해
+  `claude -p`로 돌아 대시보드에 안 보였다. 기능은 원래 있었고 메인 세션이 몰랐던 것.
+- **0.12.3** (`50e835b`):
+  - #69 GPT Fast(`30e50ea`): ChatGPT 프로바이더 `fast: {main, subagent}`. `x-claude-code-agent-id` 헤더 유무로 메인/서브에이전트를
+    가른다(`proxy.ts`), `translate.ts`가 `service_tier: "priority"`. 모든 요청 기록에 `subagent: true`. 대시보드 스위치는 격리 설치에서
+    눈으로 확인하고 저장 왕복까지 봤다. Claude 쪽 Fast를 GPT에 따라 붙이는 안은 주군이 거절(별개 의사).
+  - #71 CLI 로그인 안내(`7a391cd`): `claudeCodeLogin()`(값은 안 읽고 존재만), `doctor` 문제 `cli-not-logged-in`(원격 호스트 설치 시만),
+    `remote install` 경고, 휴대폰 오류 매핑. 맥에도 같은 일이 생길 수 있으나 CLI에 한 번이라도 로그인했으면 CLI가 스스로 갱신하므로
+    해당 없음(주군 맥이 그 경우). 관측 로그인을 호스트 CLI에 넘기는 안은 갱신 불가·약관 문제로 하지 않았다.
+- **0.12.4** (`a052808`): #70 Windows 브리지 전송(`c4d30c5`). VM 실측(문서: `docs/specs/2026-10-12-ripple-remote-native.md` Windows 절):
+  레지스트리 같음, `procStart`는 FILETIME이고 `CreationDate`와 정확히 일치, `bridgeSessionId`는 Remote Control을 켠 뒤 연 세션에만,
+  앱만 쓰면 `.credentials.json` 없음 → 관측 로그인 사용. VM에서 브리지로 보낸 메시지가 앱 세션 기록에 들어가고 답이 왔다(소스·빌드본 둘 다).
+  주의: Windows 프로세스 스냅샷은 첫 1회만 동기(실측 724ms), 이후 5초 캐시를 백그라운드 갱신 — 막 연 앱 세션을 최대 5초 늦게 본다.
+- 이슈 #54("앱의 Fast 토글을 GPT 요청에 연결")는 주군이 연동을 거절한 방향이라, 0.12.3 스위치로 대신한다고 답하고 닫을지 정하시면 된다.
+
+## ▶ 2026-10-19 — 미결만 옮김 (원래 루트 `HANDOFF.md`, 세션 6e35f80d)
+
+그 세션의 수정(대시보드 모드 설정 409 재적용 `1fe9c1e`, 앱 저장소 Play 미디어 권한 제거 `a33986a`·versionCode 7)은 커밋·푸시 완료.
+남은 것:
+1. **Play v7 심사**: '사진 및 동영상 권한' 신고 요구가 사라졌는지, 기기에서 사진 선택·파일 첨부가 그대로 되는지(주군).
+2. **추론 강도 기준**: 며칠 써 보고 xhigh/max가 너무 자주 올라가는지 판단.
+3. **DeepSeek 직결(`provider`, thehive 게이트웨이) 캐시 0% — 미완.** 10-19 하루 812건 중 276건(34%)이 `cached=0`,
+   같은 머신의 다른 프로바이더는 2~5%. 확인한 것: 요청 본문 문제 아님(앞부분 그대로), `cached=0` 다음 턴이 이전 프리픽스를
+   되찾는 경우 129/145(그 요청만 다른 곳에 떨어짐), 게이트웨이 단독·라우터 경유 시험 모두 재현 실패, 동시 12건이면 429가 섞임,
+   `fetchWithRetry`는 429를 재시도하지 않음, 실패 시각이 여러 세션에 같은 분으로 몰림.
+   유력 가설: 실사용에서 429로 떨어진 뒤 Claude Code가 다시 보낸 것이 로그에 200/`cached=0`으로만 남는다.
+   다음 수순: ① `router.log`에서 `upstream 429` 확인(10-22 기준 2건 있음), 안 남는 경로면 남기도록 하고 하루 수집
+   ② 4세션×150k 동시 + 429 섞인 상황을 라우터 경유로 재현 ③ 재현되면 429 재시도, 같은 대화 직렬화, `conversationKey`로 상류 고정 중 택일.
+   라우터 결함으로 단정할 근거는 아직 없다.
+
+## ▶ 2026-10-12~13 — 워커 판정 개편 + Ripple Remote(휴대폰) 네이티브 앱·맥 세션 연동, 커밋됨(미푸시)
+
+**상태:** 전부 커밋, **GitHub에 올리지 않음(주군 지시)**. 마지막 검증: remote 테스트 130, `npm test` 799(+3 skip),
+mod 플러그인 테스트 128, typecheck 통과. 일상 서비스 반영 완료: 라우터 설치본 교체(설정 보호 포함, 10-12 15시경),
+원격 호스트 `com.clauderipple.host` 재시작, 릴레이 웹 재배포, 아이폰 16에 개발 빌드 설치.
+`packages/cli/src/index.ts` 실행 비트 변경과 `design-drafts/`는 여전히 의도 불명이라 커밋 안 함.
+같은 기간 다른 세션이 `packages/mod`의 데스크톱 띠 그리기(`d5dd784`, `bda8e92`, `b145441`, `b6ee4c3`)를 커밋했다 — 이 세션 작업 아님.
+
+### 1. 워커 위임 (packages/mod)
+- **메인 대화는 위임 여부만 정한다.** 노출 에이전트는 `ripple:auto` 하나(`f7298de`). 등급(로우~맥스)은 판정기(제브)가 고른다.
+  실패 시 `ripple:auto`로 한 번 재위임하며 실패를 적으면 판정이 한 단계 올린다. 주군 CLAUDE.md 워커 절도 이에 맞춰 고침.
+- **판정 규칙(`ladder.ts rungOf`):** 실행(do)은 level로 로우/미디움/하이. **기획(plan, 결과물이 결정·설계·전략·검토 결론)은 standard부터 맥스**
+  (`4a998a3`), light plan만 로우. 판정 프롬프트는 "결과물이 코드·파일·빌드면 설계 문서를 읽어도 do"(`da181e0`).
+- **판정 기록:** 모든 위임이 `~/.clauderipple/logs/worker-picks.jsonl`에 남는다(최근 300줄, 판정 원문·확신·사유·실패 포함, `55b2798`).
+  배정이 이상하면 이 파일부터 본다 — 10-12 사주리플 전략이 미디움으로 간 원인(standard plan)을 이걸로 찾았다.
+- **메인 대화 강도 판정:** 낮음·중간은 "판단이 필요 없는 턴"(잡담, 사용자가 지정한 단일 단계)에만. 결정·검토·디버깅·계획·위임은 최소 높음(`51ee68d`).
+  주군 체감: 자동 강도로 Opus가 낮음·중간을 받아 "멍청해짐". 하한 설정(주군 값: 낮음~맥스)은 바꾸지 않았다 — 결정 대기.
+- **설정 덮어쓰기 사고(10-12 15:22, 11:40·12:22도 같은 원인 추정):** 옛 모드 코드가 새 형식(칸=순서형 목록)을 빈 값으로 읽고
+  기본값을 채워 전체 PUT → 주군 칸 목록·모드 "1" 소실 → 맥스=Opus 기본값으로 큰 작업이 Opus로 감. 복구 후 방지(`02a6856`):
+  PUT에 `schemaVersion` 필수(옛 코드 426 거절), 모드는 사용자 변경만 라우터 최신본에 재적용, 저장마다 `mod-settings.json.bak-<rev>` 10개 보관.
+  ⚠ 모드 코드를 바꾸면 **각 세션에서 `/reload-plugins`** 해야 새 코드가 돈다(안 하면 옛 코드가 계속 돈다 — 오늘 Opus 오배정의 첫 원인).
+  **10-13 이후:** 세션은 저장소가 아니라 `~/.clauderipple/mod` 사본을 읽는다(`settings.json` `CLAUDE_CODE_PLUGIN_DIRS`, `CLAUDE_CODE_PLUGIN_DIR_WATCH=1`).
+  사본은 main 커밋 때 git 훅이 `scripts/sync-mod.mts`로 갱신 → 커밋하면 자동 반영, 커밋 안 한 수정은 안 들어감.
+  이유: 저장소를 직접 읽으면 한 세션이 모드를 저장할 때마다 모든 세션에 "ripple reloaded (11 hooks…)"가 찍혔다. 훅이 없는 새 클론은 `node scripts/sync-mod.mts --install`.
+- 현재 주군 칸: 로우 deepseek-v4.1-flash·높음 → glm-5.3-flash·높음 / 미디움 deepseek-v4.1-flash·최대 → Luna·높음 /
+  하이 Sol·중간 → Sonnet·높음 / 맥스 Astra·중간 → Opus·높음 → Fable·중간. 모드 "1"(적극 위임, ChatGPT 한도 초기화 때 종료).
+
+### 2. Ripple Remote (packages/remote, apps/ripple-remote)
+- **구조:** 맥 상주 호스트(launchd `com.clauderipple.host`, `packages/remote/src/main.ts`) ↔ Cloudflare 릴레이
+  `https://ripple-relay.clauderipple.workers.dev`(E2EE, 릴레이는 내용 못 봄) ↔ 휴대폰. 네트워크 무관(파세오와 같은 구조).
+  호스트 재시작 `launchctl kickstart -k gui/$(id -u)/com.clauderipple.host`, 릴레이 배포 `npm run relay:deploy`, 페어링 `npm run remote -- pair`.
+- **네이티브 iOS 앱** `apps/ripple-remote`(Expo SDK 56, 워크스페이스 밖, `com.clauderipple.remote`). 프로토콜·연결·E2EE·타임라인·i18n은
+  `packages/remote`에서 import(복사 아님). 디자인은 웹앱을 Sonnet이 이식. **설치:** TestFlight 없이 개발 빌드로 직접
+  (`ios/`에서 `xcodebuild … -configuration Release -destination 'id=00008140-00126C663403801C' DEVELOPMENT_TEAM=QL9967JLCR` →
+  `xcrun devicectl device install app`). 아이폰 화면 확인: `xcrun devicectl device capture screenshot --device <id> --destination x.png`(잠금 시 검은 화면).
+  홈 화면 웹앱은 Safari와 저장소가 분리돼 링크 붙여넣기 페어링 추가(`52d9eec`).
+- **맥 세션 이어 쓰기:** 맥 앱에 열린 세션 → **Remote Control 클라이언트 API**로 진짜 사용자 입력(`2b168d5` 이후 수정 다수).
+  `POST https://api.anthropic.com/v1/code/sessions/{bridgeSessionId}/events`, 토큰은 키체인 `Claude Code-credentials`(호스트 메모리에만, 만료 5분 전·401 때 재읽기).
+  함정(모두 실측): ① `anthropic-client-platform`이 `claude_code_*`면 맥이 "다른 세션의 메시지"로 강등 — 사람 플랫폼(`ios`)이어야 함(`dc9775a`);
+  ② 이벤트 uuid는 UUID만(휴대폰 id에서 파생, `4020f4d`); ③ SSE `sequence_num`은 **문자열**, 스트림은 최신부터(`e632564`).
+  맥 앱에 안 열린 세션은 SDK `resume`으로 같은 ID 이어감. 열려 있는데 bridge 없으면 입력 차단(두 번째 writer 금지).
+  약관: 공식 문서 "인증·자격증명" 절은 제3자 개발자가 사용자 대신 구독으로 요청하거나 자격증명을 중개하는 것을 금지. 주군 판단: 개인 사용 문제없음, 기본 켜짐.
+- **휴대폰에서 시작한 세션 → 맥 앱 자동 등록:** 첫 턴 후 한 번 `claude --desktop --resume <id>`를 pty(`script`)로 실행(`ab3f2e9`).
+  맥 앱은 `entrypoint: sdk-ts` 세션을 목록 스캔에서 빼지만 UUID 직접 지정은 받는다.
+- **목록 = 맥 사이드바(`a0d7f68` 이후):** 묶음·순서 `claude_desktop_config.json` `preferences.epitaxyPrefs`(dframe-code-sections, dframe-group-scopes),
+  제목·보관 `claude-code-sessions/<acct>/<org>/local_*.json`, 안 읽음 Local Storage `epitaxy-unread-v1`(읽기 전용 LevelDB 파서, 맥 앱 파일에 절대 쓰지 않음).
+  맨 위 "최근"(작업 중·대기·안 읽음·1시간 내). **표시 규칙(실측 대조):** 대기 > 안 읽음(노란 점) > 작업 중(도는 리플, 메인 턴·서브에이전트 구분 없음) > 빈 원.
+  안 읽음 목록은 맥 앱이 늦게 저장하므로 `lastFocusedAt ≥ lastActivityAt`면 읽음(`04952d6`).
+  작업 중 판정: Remote Control `worker_status`(메인 턴) + 레지스트리 `~/.claude/sessions/<pid>.json`의 `status` busy/shell(백그라운드 포함).
+  대화 파일의 "실행 중 작업 수"는 끝 기록 없는 옛 작업이 남아 부정확 — 레지스트리 busy일 때만 셈(`a37ac41`).
+- **안정성:** 호스트가 요청마다 키체인·`ps`를 동기 호출해 이벤트 루프가 멈추고 연결이 끊겼음(CPU 28%) → 캐시로 해결(`b683efc`, `1cac96f`, 이후 CPU ~1%).
+- 그 밖: 이미지 실표시(Claude 캐시 폴더만, realpath·inode 검사), 도구 연속 사용 한 줄 접기, 최신 메시지에서 열기·줄바꿈 보존,
+  키보드 가림 수정, 리플 얼굴 표시, "Mac" 하드코딩 제거(호스트 이름/"컴퓨터", 데스크톱은 "Claude 앱").
+
+### 미결 / 다음
+- **🔴 가장 먼저 — 맥과 휴대폰의 모든 표시를 똑같이 맞추기 (주군 지시 2026-10-13).**
+  증상: 클로드리플 세션이 휴대폰은 "2분 동안 작업 중", 맥 앱은 "40분 이상 작업 중". 목록 점·작업 중·안 읽음·작업 수·제목·순서도
+  여러 번 어긋났다. **방법:** 맥 앱은 computer-use로, 휴대폰은 iOS 시뮬레이터(같은 호스트에 붙어 있음)와 아이폰 스크린샷으로
+  **직접 오가며 같은 순간의 화면을 나란히 대조**하고, 어긋나는 항목마다 원천 데이터(transcript, `~/.claude/sessions`, Remote Control
+  `worker_status`, 사이드바 저장소)를 뽑아 원인을 확정한 뒤 고친다. 짐작으로 규칙을 정하지 않는다.
+  작업 시간: **실측 확정·수정(10-13).** 클로드리플 세션에서 맥 50분(23:31:39 사람 메시지부터) vs 휴대폰 11분(호스트 첫 폴링
+  `state running` 00:12부터). 맥 세션 로그엔 `turn`·`result` 이벤트가 없고, **휴대폰은 로그 끝부분만 받아** 23:31 메시지(seq 568)를
+  아예 못 본다 — 그래서 클라이언트 리듀서만 고친 첫 수정(`1a8b076`)은 실기기에서 여전히 15분이었다. 최종: 호스트가 transcript에서
+  마지막 `origin.kind: "human"` 기록 시각을 턴 시작으로 읽어(압축 요약·작업 알림 제외, end_turn·중단에서 끊음) 세션 요약 `turnStartedAt`으로
+  보낸다. 시뮬레이터에서 00:31에 "60분 동안 작업 중" 확인. 맥 앱 화면은 computer-use로 못 찍는다(Claude 앱 자체는 제어 금지) — 맥 쪽 대조는 주군 화면이나 원천 데이터로.
+- **윈도우 호스트:** 맥 전용 4곳(launchd, 키체인, `script` pty, `ps`) — `docs/specs/2026-10-12-ripple-remote-native.md` 표. 윈도우 작업 때 진행(주군 결정).
+- **앱 푸시:** 개발 빌드는 알림 없음. EAS 프로젝트(`eas init`, rippleworks) 필요 — 외부 계정 작업이라 주군 확인 후. 의존성 audit high 19건 미검토.
+- **메인 대화 강도 하한:** 권장은 하한 "중간" 이상 — 주군 결정 대기.
+- **사주리플 전략 기획:** 미디움(deepseek)으로 돌았던 건, 맥스로 재위임할지 주군 답 대기.
+- 미검증: 이미지 전체화면·핀치, 바쁜 세션에 원격 입력 시 대기열 동작, 휴대폰 승인 카드(Remote Control control_response) 실사용.
+- 의사결정 기록: 판정 기준을 짐작으로 짜서 여러 번 틀렸다 — 화면 규칙은 **실제 세션 데이터와 맥 화면을 먼저 대조**하고 바꾼다.
+
+
+## ▶ 2026-10-11 — 리플 모드(`packages/mod`) 띠 재설계 + 설정 대시보드 이전, 커밋됨(미푸시)
+
+**상태:** 모드 변경 전부 커밋(plugin.json 0.3.0). 검증: `node --test test/mod/*.test.ts` 82, `claude plugin test
+packages/mod` 91, mod `tsc --noEmit`, `plugin validate` 통과. 실기 확인은 주군 스크린샷으로 띠·판정까지 했고,
+**빠른 설정 패널·에이전트 패널·로그의 판정 줄은 실기 미확인.** `packages/cli/src/index.ts`의 실행 비트(755) 변경은
+의도 불명이라 커밋에서 뺐다. main이 origin보다 커밋 10개+ 앞서 있다 — 푸시·릴리스는 주군 확인 후.
+모드는 `CLAUDE_CODE_PLUGIN_DIRS`로 저장소 폴더에서 직접 로드 → 수정 후 `/reload-plugins`로 반영.
+Claude가 Claude 앱 창을 computer-use로 잡는 건 불가(권한 거부) — 실기 확인은 주군 스크린샷뿐.
+
+**이번에 밝혀진 사실 (근거 있음)**
+- **깜빡임 (2026-10-11 정정):** 데스크톱 호스트는 응답마다 DOM을 통째로 갈아끼우고(`replaceWith`), Svg는 새
+  `<img data:>`·`isInteractive`면 새 `<iframe srcdoc>`로 만든다. **깜빡인 건 `isInteractive`(iframe)뿐이다** —
+  일반 Svg 이미지는 다시 그려도 깜빡이지 않고, SVG 안의 CSS @keyframes도 돈다(주군이 데스크톱 앱에서 8d43b97로
+  확인: 띠·빠른 설정의 리플이가 깜빡임 없이 움직임. Effortless도 같은 방식). 그래서 "띠에 Svg 금지"는 폐기,
+  규칙은 **Svg는 이미지로만, isInteractive 금지.** 다시 그리면 애니메이션은 처음부터 다시 시작하니 모든 루프는
+  자연스러운 자세에서 시작한다(`ripple.ts`). 유휴 시 invalidate는 표시되는 분이 바뀔 때만(`scheduleCountdown`).
+- **"클릭이 안 먹음":** 클릭·저장은 정상이었다. 켜짐/꺼짐을 흐림으로만 구분해 호스트 hover 스타일과 겹쳐
+  안 보였던 것. 지금은 켜짐 = primary(강조색 채움) 버튼, 꺼짐 = 흐린 글자.
+- **위치 흔들림:** 값에 따라 칩 폭이 바뀌던 것 → 고정 폭 슬롯, 라우트만 남는 폭을 씀.
+- **"…" 알약:** 빈 히트 라벨이 칩보다 넓어 호스트가 말줄임 → 라벨 폭 재계산.
+- **"켜진 워커 없음":** 실패한 워커 목록을 10분 캐시 → 실패는 20초, 패널 열 때 재조회.
+- **제브:** 정상. Zen 경유(`opencode.ai/zen/v1/systemone`, jev-1.13) 실호출 200·0.8초(모드 타임아웃 3초).
+  `~/.config/jev/.env`는 없고 `jevSource: zen`.
+
+**같은 날 후속**
+- Jev 확신 낮음(<0.5)은 고장이 아니다: 경고 없음, Haiku 호출 없음. 현재 강도가 Jev 확률 25% 이상이면 유지, 아니면
+  1순위 → `tipped`(성향)가 마무리. Haiku는 Jev가 실패했을 때만. 실측: 실제 작업 지시에 Jev 확신 0.52 수준이 흔하다.
+- Jev 네트워크 끊김·시간 초과는 두 번 연속일 때만 경고, 원문 소켓 에러 대신 `jevNetwork` 문구.
+- 데스크톱 띠: 글리프 대신 이름표(`강도 중간`·`캐시 41분`·`컨텍스트 38%`·`5시간 한도 64%`·`적중 100%`), `설정`은 글자,
+  판정 이유(`Jev: …`)를 라우트 뒤 흐린 한 줄로(Effortless 참고), 데스크톱 `로그` 버튼 제거(라우트가 로그 버튼).
+  모델 이름 중복 제거(`modelOf`). 한 줄 폭: ko·zh 700px, en·ja 770px, es·pt 870px.
+- 설정: 모드는 빠른 설정만(자동·성향·판정 선택·캐시 유지, 각 변경 즉시 저장, TypeSafe 키 입력은 키 없을 때만).
+  `모든 설정 열기` → 브라우저로 `<adminUrl>/#mod`(대시보드에 전부 있음). 워커 카드·탭·Save 제거, 첫 실행 2단계는 안내+버튼.
+- 에이전트 패널: 호스트 작업 목록과 겹치는 시간·토큰·현재 동작은 데스크톱에서 뺐다(우리 집계는 첫 spawn부터·단계 합산이라
+  호스트 숫자와 달랐다). 대신 모델·강도·누가 왜 골랐나·AA 점수. 터미널은 그대로 다 보인다. 살아 있는 점 Svg 제거.
+- 로그 패널: 이 세션의 판정(`판정 · Jev → 낮음 · 확신 94% · 0.6초`, 대체 시 `Jev 실패 → Haiku` + 사유)을 요청 사이에
+  시간순으로. Jev는 라우터를 안 거쳐 그전엔 어디에도 안 보였다. 판정 고장 카드는 끊김·시간 초과면 "연결이 불안정" 제목.
+- 2026-10-11 오전 KTX 망: 라우터가 "20회 연속 연결 실패 → exit 75"로 10:13·10:26 재시작. 그 사이 Jev 시간 초과 경고는 정상 동작.
+  "테스트" 첫 응답 19.4초도 판정이 아니라 Anthropic 요청 자체(같은 시각 다른 세션 31~47초).
+- 남은 디자인: 경고 카드 테마 — 주군이 Sonnet 시안 중 2번(계기판 링) 선호, 그 위에 우리 캐릭터를 얹는 방향.
+  Opus·Sonnet 비교 시안은 망 문제로 중단 — 다시 시킬 것(브리핑: 링=몸, 상태별 표정, 원문 고정 SVG, Clawd·Effortless 금지).
+- `claude plugin test`의 keep-warm 테스트 1~2개는 머신 부하(load 150) 때 5초 타임아웃으로 떨어진다 — 부하 없을 때 87/87.
+
+**남은 일 / 알려진 흠**
+- 강도·캐시 칸 사이 간격이 아직 넓다. 700px에선 라우트가 줄어들거나 숨는다.
+- 라우터는 설치된 빌드로 돈다 → `swampAlert`, 띠 ctx/한도 토글 설정은 라우터 재빌드·재설치 후에야 저장이 유지된다.
+- 이 작업 중 서브에이전트 하나가 band.tsx 일부를 python으로 통째 교체했다(규칙 위반, 결과는 확인됨).
+- 미리보기 리그·스크린샷은 세션 스크래치패드(`…/scratchpad/ui-preview/`)에만 있어 다음 세션엔 없다.
+
+---
+
+# 인수인계 — 2026-09-20
 
 > 다음 세션이 처음 읽을 문서. 기술 근거는 `docs/ARCHITECTURE.md`, 규칙은 `CLAUDE.md`,
 > 릴리스 절차는 `docs/RELEASE.md`, 경쟁 제품 대조는 `docs/OPENCODEX.md`.

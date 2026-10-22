@@ -35,6 +35,8 @@ export const GOOGLE_OAUTH = {
   prodApi: "https://cloudcode-pa.googleapis.com",
   /** Streaming and `onboardUser` use the daily host. Source: opencodex `src/oauth/google-antigravity.ts:24-25`. */
   dailyApi: "https://daily-cloudcode-pa.googleapis.com",
+  /** The two Cloud Code Assist hosts. They offer different models and count quota separately. */
+  hosts: ["https://daily-cloudcode-pa.googleapis.com", "https://cloudcode-pa.googleapis.com"] as const,
   apiVersion: "v1internal",
   /** Preferred loopback port; the callback path is fixed. Source: opencodex `src/oauth/google-antigravity.ts:34-35`. */
   port: 51121,
@@ -101,8 +103,12 @@ export function resolveAntigravityThinkingLevel(effort: string | undefined): "lo
  * `ANTIGRAVITY_EFFORT_WIRE_MAP` / `ANTIGRAVITY_SUFFIX_TIER_MODELS`.
  */
 const SUFFIX_TIER_MODELS: Record<string, { wire: Record<string, string>; default: string }> = {
+  // High rides on the medium tier: `-high` thinks with no budget (the catalogue's thinkingBudget -1,
+  // against 4000 for medium), and on 2026-10-17 the requests past 4000 output tokens took 64% of all
+  // request time. The owner chose speed over the deeper tier (2026-10-20). `-high` named outright
+  // still goes through as it is.
   "gemini-3.8-flash": {
-    wire: { low: "gemini-3.8-flash-low", medium: "gemini-3.8-flash-medium", high: "gemini-3.8-flash-high" },
+    wire: { low: "gemini-3.8-flash-low", medium: "gemini-3.8-flash-medium", high: "gemini-3.8-flash-medium" },
     default: "medium",
   },
 };
@@ -248,15 +254,19 @@ function collapseWireId(wireId: string): string {
   return wireId;
 }
 
+/** One host's catalogue: the picker rows and the wire ids they were collapsed from. */
+export type ParsedHostCatalogue = { models: ProviderModel[]; wireIds: string[] };
+
 /**
- * Parse `POST {dailyApi}/v1internal:fetchAvailableModels`. The body groups agent-callable models
- * under `agentModelSorts[].groups[].modelIds`, with tiered Flash ids under `tieredModelIds.flash`, and
- * describes each in `models[wireId]` (`maxTokens`). Source: opencodex
+ * Parse one host's `POST {host}/v1internal:fetchAvailableModels`. The body groups agent-callable
+ * models under `agentModelSorts[].groups[].modelIds`, with tiered Flash ids under
+ * `tieredModelIds.flash`, and describes each in `models[wireId]` (`maxTokens`). Source: opencodex
  * `parseAntigravityAvailableModels` (src/providers/antigravity-models.ts:489-560).
  *
  * Returns null when the shape is unreadable, so the caller falls back instead of showing nothing.
+ * The wire ids are kept so per-model host routing can match an exact wire id as well as a base id.
  */
-export function parseAvailableModels(payload: unknown, limit = 200): ProviderModel[] | null {
+export function parseHostCatalogue(payload: unknown, limit = 200): ParsedHostCatalogue | null {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const body = payload as Record<string, unknown>;
   const models = body.models;
@@ -267,9 +277,11 @@ export function parseAvailableModels(payload: unknown, limit = 200): ProviderMod
   // Collapse each wire id to its base id first, then take the context window and display name from
   // the first wire id that carried that base. A collapsed id is what routing understands.
   const collapsed = new Map<string, string>();
+  const wireIds: string[] = [];
   const add = (wireId: string): void => {
     if (typeof wireId !== "string" || !available.has(wireId)) return;
     const id = collapseWireId(wireId);
+    wireIds.push(wireId);
     if (!collapsed.has(id)) collapsed.set(id, wireId);
   };
   const sorts = Array.isArray(body.agentModelSorts) ? body.agentModelSorts : [];
@@ -297,7 +309,33 @@ export function parseAvailableModels(payload: unknown, limit = 200): ProviderMod
     });
     if (out.length >= limit) break;
   }
-  return out.length > 0 ? out : null;
+  return out.length > 0 ? { models: out, wireIds } : null;
+}
+
+/** The picker rows of one host's body, or null when the shape is unreadable. */
+export function parseAvailableModels(payload: unknown, limit = 200): ProviderModel[] | null {
+  return parseHostCatalogue(payload, limit)?.models ?? null;
+}
+
+/**
+ * Which hosts offer each model id. A model's own id or any of its collapsed wire ids may name it,
+ * because a host's catalogue lists wire ids (`gemini-3.8-flash-high`) while routing resolves a base
+ * id (`gemini-3.8-flash`). Daily comes first in the list, so it is the preferred host.
+ */
+export type HostMap = Map<string, string[]>;
+
+/** Build the per-model host map from each host's catalogue; a host with no catalogue contributes nothing. */
+export function buildHostMap(cataloguesByHost: ReadonlyMap<string, ParsedHostCatalogue>): HostMap {
+  const map: HostMap = new Map();
+  for (const [host, catalogue] of cataloguesByHost) {
+    const names = new Set<string>([...catalogue.models.map((m) => m.id), ...catalogue.wireIds]);
+    for (const name of names) {
+      const hosts = map.get(name) ?? [];
+      if (!hosts.includes(host)) hosts.push(host);
+      map.set(name, hosts);
+    }
+  }
+  return map;
 }
 
 // ── Project discovery ───────────────────────────────────────────────────────────────────────────
@@ -393,18 +431,65 @@ export async function fetchUserEmail(accessToken: string, fetchImpl: FetchLike =
   }
 }
 
-/** The models a CCA account can reach now, or null when the endpoint cannot be read. */
-export async function fetchAvailableModels(accessToken: string, projectId: string, fetchImpl: FetchLike = fetch, signal?: AbortSignal): Promise<ProviderModel[] | null> {
+/** One host's catalogue, or null when the endpoint cannot be read. Never throws. */
+export async function fetchHostCatalogue(accessToken: string, projectId: string, host: string, fetchImpl: FetchLike = fetch, signal?: AbortSignal): Promise<ParsedHostCatalogue | null> {
   try {
-    const response = await fetchImpl(`${GOOGLE_OAUTH.dailyApi}/${GOOGLE_OAUTH.apiVersion}:fetchAvailableModels`, {
+    const response = await fetchImpl(`${host}/${GOOGLE_OAUTH.apiVersion}:fetchAvailableModels`, {
       method: "POST",
       headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": antigravityUserAgent() },
       body: JSON.stringify({ project: projectId }),
       signal: signalFor(signal),
     });
     if (!response.ok) return null;
-    return parseAvailableModels(await response.json().catch(() => undefined));
+    return parseHostCatalogue(await response.json().catch(() => undefined));
   } catch {
     return null;
   }
+}
+
+/** The merged catalogue of every host that answered, and which hosts offer which model. */
+export type MergedCatalogue = {
+  models: ProviderModel[];
+  /** Model id (or any collapsed wire id) → the hosts that offer it, preferred host first. */
+  hosts: HostMap;
+  /** The per-host catalogues that were readable. */
+  byHost: Map<string, ParsedHostCatalogue>;
+};
+
+/**
+ * The models a CCA account can reach, asked on every host that offers them (measured 2026-10-20:
+ * the prod host lists Gemini Pro models the daily host does not, and vice versa for some Flash
+ * tiers). Models are merged with the preferred host's row winning, and the returned host map is
+ * what routing uses to send a model to a host that actually offers it. Null when no host answered.
+ */
+export async function fetchAvailableModels(
+  accessToken: string,
+  projectId: string,
+  opts: { hosts?: readonly string[]; fetchImpl?: FetchLike; signal?: AbortSignal } = {},
+): Promise<MergedCatalogue | null> {
+  const hosts = opts.hosts ?? GOOGLE_OAUTH.hosts;
+  const results = await Promise.all(hosts.map(async (host) => [host, await fetchHostCatalogue(accessToken, projectId, host, opts.fetchImpl ?? fetch, opts.signal)] as const));
+  const byHost = new Map<string, ParsedHostCatalogue>();
+  for (const [host, catalogue] of results) if (catalogue) byHost.set(host, catalogue);
+  if (byHost.size === 0) return null;
+  // Host order is preference order (daily first), so the first host to list a model keeps its row
+  // and a failing host simply contributes nothing to the merge.
+  const models: ProviderModel[] = [];
+  const seen = new Set<string>();
+  for (const catalogue of byHost.values()) {
+    for (const model of catalogue.models) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      models.push(model);
+    }
+  }
+  return { models, hosts: buildHostMap(byHost), byHost };
+}
+
+/**
+ * The host a model's request should go to: the first host in `hosts` that offers the resolved wire
+ * id or the base id, else `fallback`. An unknown model is not hidden — it goes to the default only.
+ */
+export function hostForModel(hosts: ReadonlyMap<string, readonly string[]>, model: string, wire: string, fallback: string): string {
+  return hosts.get(wire)?.[0] ?? hosts.get(model)?.[0] ?? fallback;
 }

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
+import { UsageHistory, addTotals, emptyTotals, finishTotals, recordTotals, sortByVolume, type BucketTotals, type SummaryBucket, type UsageSummary } from "./usage-history.ts";
 
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_CARRY = 64 * 1024;
@@ -19,11 +20,18 @@ export type RequestRecord = {
   ms: number;
   status: number | string;
   ok: boolean;
-  kind: "messages" | "count_tokens" | "other";
+  kind: "messages" | "count_tokens" | "other" | "image";
   source: string;
   target: string;
   provider: string;
   effort?: string;
+  upstreamRequestId?: string;
+  messageId?: string;
+  upstreamCalled?: false;
+  refusal?: "thread-continue" | "drain" | "unroutable" | "no-account" | "unknown-provider" | "web-search-unsupported" | "prompt-incompatible";
+  purpose?: "auto-mode-classifier" | "web-search" | "web-fetch";
+  requestedTier?: string;
+  servedTier?: string;
   stopReason?: string;
   usage?: RequestUsage;
   note?: string;
@@ -34,33 +42,32 @@ export type RequestRecord = {
    * session ask what happened to its own requests.
    */
   session?: string;
+  /**
+   * The request was made inside a subagent: Claude Code names the agent in the
+   * `x-claude-code-agent-id` header, and only a subagent's request carries it (CLI 2.1.304).
+   * Absent on a main session's own turns. Recorded for every provider, so the header's arrival
+   * can be measured rather than assumed.
+   */
+  subagent?: true;
+  /**
+   * Not ok, but the client sends the request again on its own and nothing is lost: a thread the
+   * API forgot, a stateless resend asked for, a refusal during a restart. Shown apart from failures
+   * so they do not read as errors.
+   */
+  resent?: true;
 };
 
-type RequestFilter = { provider?: string; kind?: RequestRecord["kind"]; session?: string };
-type SummaryBucket = {
-  count: number;
-  ok: number;
-  failed: number;
-  input: number;
-  cached: number;
-  /** Tokens written to the prompt cache: part of the input, and not a hit. */
-  cacheWrite: number;
-  output: number;
-  cacheHitPercent: number;
-  avgMs: number;
-};
+/** A kind or a set of kinds; a record matches any of them. */
+type RequestFilter = { provider?: string; kind?: RequestRecord["kind"] | RequestRecord["kind"][]; session?: string };
 
-export type RequestSummary = { total: SummaryBucket; providers: Record<string, SummaryBucket> };
-
-function emptyBucket(): SummaryBucket {
-  return { count: 0, ok: 0, failed: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, cacheHitPercent: 0, avgMs: 0 };
-}
+export type RequestSummary = { total: SummaryBucket; providers: Record<string, SummaryBucket>; models: (SummaryBucket & { provider: string; model: string })[] };
+export type { SummaryBucket };
 
 function isRecord(value: unknown): value is RequestRecord {
   if (!value || typeof value !== "object") return false;
   const r = value as Partial<RequestRecord>;
   return typeof r.id === "string" && typeof r.at === "string" && typeof r.ms === "number" && typeof r.ok === "boolean" &&
-    (r.kind === "messages" || r.kind === "count_tokens" || r.kind === "other") && typeof r.source === "string" &&
+    (r.kind === "messages" || r.kind === "count_tokens" || r.kind === "other" || r.kind === "image") && typeof r.source === "string" &&
     typeof r.target === "string" && typeof r.provider === "string" && typeof r.stream === "boolean";
 }
 
@@ -70,15 +77,31 @@ export class RequestLog {
   private readonly max: number;
   private readonly maxBytes: number;
   private records: RequestRecord[];
+  private readonly history: UsageHistory;
 
   constructor(file: string, max = 2000, maxBytes = DEFAULT_MAX_BYTES) {
     this.file = file;
     this.max = max;
     this.maxBytes = maxBytes;
-    this.records = this.load();
+    const persisted = this.readRecords(this.file);
+    this.records = persisted.slice(-this.max);
+    this.history = new UsageHistory(path.join(path.dirname(file), "usage-hourly.jsonl"));
+    // Replay what the history has not seen yet: the `.1` file first when it may hold a record above
+    // the watermark, so the first run backfills both files. Its mtime is its last append, and a
+    // record starts before it is written, so an mtime at or below the watermark hour rules it out;
+    // the first record of requests.jsonl does not, since a long request that straddled the rotation
+    // starts earlier than records left in `.1`. The history skips everything at or below its
+    // watermark, so a restart counts no hour twice.
+    const watermark = this.history.watermark;
+    const rotatedHour = usageHourOfFile(`${file}.1`);
+    const replay = rotatedHour !== null && (watermark === null || rotatedHour > watermark)
+      ? [...this.readRecords(`${file}.1`), ...persisted]
+      : persisted;
+    this.history.replay(replay);
   }
 
   add(record: RequestRecord): void {
+    this.history.add(record);
     this.records.push(record);
     if (this.records.length > this.max) this.records.splice(0, this.records.length - this.max);
     const line = JSON.stringify(record) + "\n";
@@ -99,11 +122,12 @@ export class RequestLog {
 
   list(n: number, filter: RequestFilter = {}): RequestRecord[] {
     const limit = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+    const kind = filter.kind === undefined ? undefined : Array.isArray(filter.kind) ? filter.kind : [filter.kind];
     const out: RequestRecord[] = [];
     for (let i = this.records.length - 1; i >= 0 && out.length < limit; i--) {
       const record = this.records[i]!;
       if (filter.provider && record.provider !== filter.provider) continue;
-      if (filter.kind && record.kind !== filter.kind) continue;
+      if (kind && !kind.includes(record.kind)) continue;
       if (filter.session && record.session !== filter.session) continue;
       out.push(record);
     }
@@ -112,43 +136,34 @@ export class RequestLog {
 
   /** Summarise records at or after an epoch timestamp in milliseconds. */
   summary(sinceMs: number): RequestSummary {
-    const total = emptyBucket();
-    const providers: Record<string, SummaryBucket> = {};
-    const cacheBases = new Map<SummaryBucket, number>();
-    const add = (bucket: SummaryBucket, record: RequestRecord): void => {
-      bucket.count++;
-      if (record.ok) bucket.ok++;
-      else bucket.failed++;
-      bucket.avgMs += record.ms;
-      if (record.usage) {
-        bucket.input += record.usage.input;
-        bucket.cached += record.usage.cached;
-        bucket.cacheWrite += record.usage.cacheWrite ?? 0;
-        bucket.output += record.usage.output;
-        // A cache write is input the model read fresh, so it counts against the hit rate. Leaving it
-        // out read a turn that wrote 2,218 tokens and uncached 2 as a 100% hit (2026-09-23).
-        cacheBases.set(bucket, (cacheBases.get(bucket) ?? 0) + record.usage.input + record.usage.cached + (record.usage.cacheWrite ?? 0));
-      }
-    };
+    const total = emptyTotals();
+    const providers = new Map<string, BucketTotals>();
+    const models = new Map<string, { totals: BucketTotals; provider: string; model: string }>();
     for (const record of this.records) {
       const at = Date.parse(record.at);
       if (!Number.isFinite(at) || at < sinceMs) continue;
-      const provider = providers[record.provider] ?? (providers[record.provider] = emptyBucket());
-      add(total, record);
-      add(provider, record);
+      const provider = providers.get(record.provider) ?? providers.set(record.provider, emptyTotals()).get(record.provider)!;
+      const key = `${record.provider}\u0000${record.target}`;
+      const model = models.get(key) ?? models.set(key, { totals: emptyTotals(), provider: record.provider, model: record.target }).get(key)!;
+      for (const bucket of [total, provider, model.totals]) addTotals(bucket, recordTotals(record));
     }
-    for (const bucket of [total, ...Object.values(providers)]) {
-      if (bucket.count > 0) bucket.avgMs = Math.round(bucket.avgMs / bucket.count);
-      const base = cacheBases.get(bucket) ?? 0;
-      bucket.cacheHitPercent = base > 0 ? Math.round((bucket.cached / base) * 1000) / 10 : 0;
-    }
-    return { total, providers };
+    const modelsList = [...models.values()].map(({ totals, provider, model }) => ({ ...finishTotals(totals), provider, model }));
+    sortByVolume(modelsList);
+    return {
+      total: finishTotals(total),
+      providers: Object.fromEntries([...providers].map(([name, totals]) => [name, finishTotals(totals)])),
+      models: modelsList,
+    };
   }
 
-  private load(): RequestRecord[] {
+  /** Durable hourly usage over [fromMs, toMs), beyond the in-memory ring. */
+  usage(fromMs: number, toMs: number): UsageSummary {
+    return this.history.summary(fromMs, toMs);
+  }
+
+  private readRecords(file: string): RequestRecord[] {
     try {
-      if (!fs.existsSync(this.file)) return [];
-      const records = fs.readFileSync(this.file, "utf8")
+      return fs.readFileSync(file, "utf8")
         .split("\n")
         .flatMap((line) => {
           try {
@@ -158,14 +173,22 @@ export class RequestLog {
             return [];
           }
         });
-      return records.slice(-this.max);
     } catch {
       return [];
     }
   }
 }
 
-export type ObservedResponse = { usage?: RequestUsage; stopReason?: string };
+/** The hour of a file's last write, or null when it does not exist. */
+function usageHourOfFile(file: string): number | null {
+  try {
+    return Math.floor(fs.statSync(file).mtimeMs / 3_600_000);
+  } catch {
+    return null;
+  }
+}
+
+export type ObservedResponse = { usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string };
 
 /**
  * Observes an Anthropic-compatible response without retaining or modifying its bytes.
@@ -175,6 +198,7 @@ export class ResponseUsageTap {
   private readonly isSse: boolean;
   private readonly decoder = new TextDecoder();
   private carry = "";
+  private skipSseLine = false;
   private event = "";
   private data: string[] = [];
   private dropUntilNewline = false;
@@ -183,6 +207,13 @@ export class ResponseUsageTap {
   private jsonUsageText = "";
   private stopCarry = "";
   private stopReason: string | undefined;
+  private messageId: string | undefined;
+  private servedTier: string | undefined;
+  private jsonDepth = 0;
+  private jsonString: string | null = null;
+  private jsonEscaped = false;
+  private jsonKey: string | undefined;
+  private jsonValue = false;
   private usage: RequestUsage | undefined;
 
   // Compressed responses (Anthropic answers the CLI with gzip/br) are collected side-band up to a cap
@@ -249,28 +280,28 @@ export class ResponseUsageTap {
       else this.feedJson(tail);
     }
     if (this.isSse && this.carry) this.feedSse("\n");
-    return { ...(this.usage ? { usage: this.usage } : {}), ...(this.stopReason ? { stopReason: this.stopReason } : {}) };
+    return {
+      ...(this.usage ? { usage: this.usage } : {}),
+      ...(this.stopReason ? { stopReason: this.stopReason } : {}),
+      ...(this.messageId !== undefined ? { messageId: this.messageId } : {}),
+      ...(this.servedTier !== undefined ? { servedTier: this.servedTier } : {}),
+    };
   }
 
+  // Complete lines are consumed before the cap applies, so an inflated body or one large chunk keeps
+  // its events; only an unfinished line longer than the cap is dropped, along with its later bytes.
   private feedSse(text: string): void {
-    this.carry += text;
-    if (this.carry.length > MAX_CARRY) {
-      const newline = this.carry.lastIndexOf("\n");
-      if (newline < 0) {
-        this.carry = "";
-        this.event = "";
-        this.data = [];
-        return;
-      }
-      this.carry = this.carry.slice(newline + 1);
-      this.event = "";
-      this.data = [];
-    }
+    const buffer = this.carry + text;
+    let start = 0;
     for (;;) {
-      const newline = this.carry.indexOf("\n");
-      if (newline < 0) return;
-      const raw = this.carry.slice(0, newline);
-      this.carry = this.carry.slice(newline + 1);
+      const newline = buffer.indexOf("\n", start);
+      if (newline < 0) break;
+      const raw = buffer.slice(start, newline);
+      start = newline + 1;
+      if (this.skipSseLine) {
+        this.skipSseLine = false;
+        continue;
+      }
       const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
       if (line === "") {
         this.consumeSseEvent();
@@ -282,6 +313,13 @@ export class ResponseUsageTap {
         this.data.push(line.slice(5).trimStart());
       }
     }
+    this.carry = buffer.slice(start);
+    if (this.carry.length > MAX_CARRY) {
+      this.carry = "";
+      this.skipSseLine = true;
+      this.event = "";
+      this.data = [];
+    }
   }
 
   private consumeSseEvent(): void {
@@ -289,7 +327,8 @@ export class ResponseUsageTap {
     try {
       const body = JSON.parse(this.data.join("\n")) as Record<string, unknown>;
       if (this.event === "message_start" || body.type === "message_start") {
-        const message = body.message as { usage?: unknown } | undefined;
+        const message = body.message as { id?: unknown; usage?: unknown } | undefined;
+        if (typeof message?.id === "string") this.messageId = message.id;
         this.setUsage(message?.usage);
       } else if (this.event === "message_delta" || body.type === "message_delta") {
         this.setUsage(body.usage);
@@ -302,6 +341,28 @@ export class ResponseUsageTap {
   }
 
   private feedJson(text: string): void {
+    // Read only the top-level id, never an id quoted in content or a tool input.
+    for (const char of text) {
+      if (this.jsonString !== null) {
+        if (this.jsonString.length < 256) this.jsonString += char;
+        if (this.jsonEscaped) this.jsonEscaped = false;
+        else if (char === "\\") this.jsonEscaped = true;
+        else if (char === '"') {
+          if (this.jsonDepth === 1) {
+            try {
+              const value: unknown = JSON.parse(this.jsonString);
+              if (!this.jsonValue && typeof value === "string") this.jsonKey = value;
+              else if (this.jsonKey === "id" && typeof value === "string") this.messageId = value;
+            } catch { /* oversized or malformed string */ }
+          }
+          this.jsonString = null;
+        }
+      } else if (char === '"') this.jsonString = '"';
+      else if (char === "{" || char === "[") this.jsonDepth++;
+      else if (char === "}" || char === "]") this.jsonDepth--;
+      else if (this.jsonDepth === 1 && char === ":") this.jsonValue = true;
+      else if (this.jsonDepth === 1 && char === ",") { this.jsonValue = false; this.jsonKey = undefined; }
+    }
     this.carry += text;
     this.stopCarry = (this.stopCarry + text).slice(-MAX_CARRY);
     const stop = /"stop_reason"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(this.stopCarry);
@@ -328,6 +389,7 @@ export class ResponseUsageTap {
       this.jsonUsageText = "";
       return;
     }
+    this.jsonUsageDepth = 0;
     let quoted = false;
     let escaped = false;
     for (let i = 0; i < this.jsonUsageText.length; i++) {
@@ -352,14 +414,17 @@ export class ResponseUsageTap {
   private setUsage(value: unknown): void {
     if (!value || typeof value !== "object") return;
     const usage = value as Record<string, unknown>;
+    if (typeof usage.service_tier === "string") this.servedTier = usage.service_tier;
     const number = (key: string): number => typeof usage[key] === "number" && Number.isFinite(usage[key]) ? Math.max(0, usage[key] as number) : 0;
     if (!("input_tokens" in usage || "output_tokens" in usage || "cache_read_input_tokens" in usage || "cache_creation_input_tokens" in usage)) return;
     const current = this.usage ?? { input: 0, cached: 0, output: 0 };
     const input = "input_tokens" in usage ? number("input_tokens") : current.input;
     const cached = "cache_read_input_tokens" in usage ? number("cache_read_input_tokens") : current.cached;
-    const cacheWrite = "cache_creation_input_tokens" in usage ? number("cache_creation_input_tokens") : current.cacheWrite;
+    const cacheWrite = "cache_creation_input_tokens" in usage
+      ? typeof usage.cache_creation_input_tokens === "number" && Number.isFinite(usage.cache_creation_input_tokens) ? number("cache_creation_input_tokens") : undefined
+      : current.cacheWrite;
     const output = "output_tokens" in usage ? number("output_tokens") : current.output;
-    this.usage = { input, cached, ...(cacheWrite && cacheWrite > 0 ? { cacheWrite } : {}), output };
+    this.usage = { input, cached, ...(cacheWrite !== undefined ? { cacheWrite } : {}), output };
   }
 }
 

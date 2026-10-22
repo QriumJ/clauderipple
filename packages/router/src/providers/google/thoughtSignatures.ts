@@ -16,6 +16,12 @@
 /** Upper bound on remembered signatures. Far more than a conversation holds; small enough to forget. */
 const DEFAULT_LIMIT = 10_000;
 
+/** What the adapter and translator need of a signature store; a host-scoped view has the same shape. */
+export type ThoughtSignatureSink = {
+  get(id: string): string | undefined;
+  set(id: string, signature: string): void;
+};
+
 export class ThoughtSignatureStore {
   // Insertion order is the LRU order: a get re-inserts, a set past the limit drops the oldest.
   private readonly map = new Map<string, string>();
@@ -43,6 +49,20 @@ export class ThoughtSignatureStore {
       if (oldest === undefined) break;
       this.map.delete(oldest);
     }
+  }
+
+  /**
+   * A view whose keys carry the Cloud Code Assist host the signature came from. Cloud Code Assist
+   * runs on two hosts with separate state, and replaying a signature minted on one to the other is
+   * what the backend refuses (TYPE_BYTES), so a conversation that moves between hosts must not
+   * find the other host's signature. The shared store keeps the LRU bound across both views.
+   */
+  scope(host: string): ThoughtSignatureSink {
+    const prefix = `${host}\u0000`;
+    return {
+      get: (id) => this.get(prefix + id),
+      set: (id, signature) => this.set(prefix + id, signature),
+    };
   }
 
   get size(): number { return this.map.size; }

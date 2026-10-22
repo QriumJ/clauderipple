@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { ChatGptAdapter, rateLimitsFromHeaders, rateLimitsFromUsage, streamHold } from "../src/providers/chatgpt/index.ts";
 import { Logger } from "../src/log.ts";
+import { decodeEnvelope, encodeEnvelope } from "../src/reasoning.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-"));
@@ -15,7 +16,7 @@ fs.writeFileSync(path.join(home, "chatgpt-auth.json"), JSON.stringify({ accessTo
 
 type Seen = { headers: http.IncomingHttpHeaders; body: Record<string, unknown>; path: string };
 const seen: Seen[] = [];
-let mode: "stream" | "search" | "image" | "image-refused" | "error429" | "sse-error" | "cut-off" | "context-error" | "slow-first-item" = "stream";
+let mode: "stream" | "search" | "image" | "image-refused" | "error429" | "sse-error" | "cut-off" | "context-error" | "slow-first-item" | "sealed" | "refuse-reasoning" = "stream";
 // Active quota lookup (GET /wham/usage): its own mode so it can be exercised independently.
 let usageMode: "ok" | "unauthorized" | "no-window" = "ok";
 let usageHits = 0;
@@ -106,6 +107,11 @@ const backend = http.createServer((req, res) => {
         .end(JSON.stringify({ error: { message: "The usage limit has been reached", type: "usage_limit_reached" } }));
       return;
     }
+    // The backend refusing the sealed reasoning it was handed back (another account, another model).
+    if (mode === "refuse-reasoning" && JSON.stringify(seen.at(-1)!.body).includes("encrypted_content")) {
+      res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "Invalid value for 'input[1].encrypted_content': not produced by this model" } }));
+      return;
+    }
     // Every real answer carries the backend's opaque turn token; count them so a test can tell
     // which one the adapter echoed.
     turnStates += 1;
@@ -126,6 +132,16 @@ const backend = http.createServer((req, res) => {
     }
     if (mode === "cut-off") {
       res.end(sse([{ type: "response.created", response: {} }, { type: "response.output_text.delta", delta: "Hal" }]));
+      return;
+    }
+    if (mode === "sealed") {
+      res.end(sse([
+        { type: "response.created", response: { id: "resp_x" } },
+        { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } },
+        { type: "response.reasoning_summary_text.delta", delta: "thinking…", item_id: "rs_1" },
+        { type: "response.output_item.done", item: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" } },
+        ...happy.slice(5),
+      ]));
       return;
     }
     const body = sse(happy);
@@ -248,6 +264,8 @@ test("image generation sends the hosted tool with references and returns the dec
     { type: "input_image", image_url: "data:image/png;base64,QUJD" },
   ]);
   assert.equal(image.data.toString(), "PNGDATA");
+  // The turn's usage comes from `response.completed`, converted like a translated turn's.
+  assert.deepEqual(image.usage, { input: 2249, cached: 0, output: 75 });
   assert.deepEqual({ format: image.format, size: image.size, quality: image.quality, revisedPrompt: image.revisedPrompt }, { format: "png", size: "1536x1024", quality: "low", revisedPrompt: "a boat" });
 });
 
@@ -306,8 +324,35 @@ test("HTTP 429 upstream → Anthropic rate_limit_error 429", async () => {
   adapter.clearCooldown("legacy");
 });
 
+test("a usage lookup that finds room ends a usage-limit cooldown (limit reset or plan topped up)", async () => {
+  mode = "error429";
+  await call(request);
+  assert.equal(adapter.accountStatus()[0]?.state, "cooling");
+  mode = "stream";
+  usageMode = "ok"; // primary window at 40%
+  await adapter.fetchRateLimits();
+  assert.equal(adapter.accountStatus()[0]?.state, "ready");
+  assert.equal(adapter.hasUsable(), true);
+});
+
 test("rateLimitsFromHeaders: missing headers → null", () => {
   assert.equal(rateLimitsFromHeaders(new Headers({ "content-type": "text/event-stream" })), null);
+});
+
+test("credits are read from the headers (Python-style booleans) and from /wham/usage", () => {
+  const fromHeaders = rateLimitsFromHeaders(new Headers({
+    "x-codex-primary-used-percent": "100",
+    "x-codex-credits-has-credits": "True",
+    "x-codex-credits-unlimited": "False",
+    "x-codex-credits-balance": "1250",
+  }));
+  assert.deepEqual(fromHeaders?.credits, { has_credits: true, unlimited: false, balance: "1250" });
+  assert.equal(rateLimitsFromHeaders(new Headers({ "x-codex-primary-used-percent": "100" }))?.credits, undefined);
+  const fromUsage = rateLimitsFromUsage({
+    rate_limit: { primary_window: { used_percent: 100 } },
+    credits: { has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0" },
+  });
+  assert.deepEqual(fromUsage?.credits, { has_credits: false, unlimited: false, balance: "0", overage_limit_reached: false });
 });
 
 // The backend closing without response.completed used to be finished as end_turn with what had
@@ -450,6 +495,62 @@ test("a stream whose first item is slow still opens once the hold runs out, and 
   } finally {
     streamHold.ms = saved;
   }
+});
+
+// ---- reasoning replay through the Codex adapter (reasoning.ts) ----------------------------------
+
+// The backend's sealed reasoning is handed to the client in a carrier block, and that block comes
+// back on the next turn in the position the CLI replays it — beside the call it describes, which is
+// the position the wire expects it in (native behaviour). One round trip proves the loop closes.
+test("a sealed reasoning item is carried to the client and replayed on the next turn", async () => {
+  mode = "sealed";
+  const first = await call({ ...request, stream: false });
+  assert.equal(first.status, 200);
+  assert.deepEqual(seen.at(-1)?.body.include, ["reasoning.encrypted_content"], "asked for from the first turn, or nothing is ever sealed");
+  const message = JSON.parse(first.text) as { content: { type: string; thinking?: string; signature?: string }[] };
+  const carried = message.content.find((b) => b.type === "thinking")!;
+  assert.equal(carried.thinking, "thinking…");
+  assert.deepEqual(decodeEnvelope(carried.signature), {
+    w: "responses",
+    p: "chatgpt",
+    m: "gpt-5.6-terra",
+    r: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" },
+  });
+
+  const second = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(second.status, 200);
+  const replayed = seen.at(-1)!.body as { include?: unknown; input: unknown[] };
+  assert.deepEqual(replayed.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(replayed.input[1], { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" });
+  assert.deepEqual(replayed.input[2], { type: "function_call", call_id: "call_1", name: "Read", arguments: '{"file_path":"a.ts"}' });
+});
+
+// A sealed blob is only valid where it was minted: when the backend refuses the one carried back —
+// the conversation moved accounts, or the model is not the model any more — the turn is asked again
+// without it rather than answered with an error the user cannot act on (reasoning.ts).
+test("a refusal naming the replayed reasoning is retried once without it", async () => {
+  mode = "refuse-reasoning";
+  const carried = { type: "thinking", thinking: "", signature: encodeEnvelope({ w: "responses", p: "chatgpt", m: "gpt-5.6-terra", r: { type: "reasoning", encrypted_content: "gAAAAsealed" } }) };
+  const response = await call({
+    ...request,
+    stream: false,
+    messages: [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: [carried, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+    ],
+  });
+  assert.equal(response.status, 200, "the retry answered, the refusal did not reach the user");
+  const attempts = seen.slice(-2).map((s) => JSON.stringify(s.body).includes("encrypted_content"));
+  assert.deepEqual(attempts, [true, false], "the second ask carried no reasoning");
 });
 
 test("cleanup", () => {

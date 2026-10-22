@@ -13,11 +13,20 @@ import type { Credential } from "../pool.ts";
 
 type Window = { utilization?: unknown; resets_at?: unknown } | null | undefined;
 
+/** One entry of the `/api/oauth/usage` body's `limits` array (shape measured 2026-10-15). */
+type ScopedEntry = {
+  kind?: unknown;
+  group?: unknown;
+  percent?: unknown;
+  resets_at?: unknown;
+  scope?: { model?: { id?: unknown; display_name?: unknown } | null } | null;
+} | null | undefined;
+
 const FIVE_HOURS = 5 * 60;
 const WEEK = 7 * 24 * 60;
 
 export function claudeUsageFromBody(body: unknown): Record<string, unknown> | null {
-  const b = body as { five_hour?: Window; seven_day?: Window } | null;
+  const b = body as { five_hour?: Window; seven_day?: Window; limits?: unknown } | null;
   const win = (w: Window, minutes: number): Record<string, number> | null => {
     if (!w || typeof w.utilization !== "number" || !Number.isFinite(w.utilization)) return null;
     const out: Record<string, number> = { used_percent: w.utilization, window_minutes: minutes };
@@ -28,7 +37,36 @@ export function claudeUsageFromBody(body: unknown): Record<string, unknown> | nu
   const primary = win(b?.five_hour, FIVE_HOURS);
   const secondary = win(b?.seven_day, WEEK);
   if (!primary && !secondary) return null;
-  return { type: "claude.usage", rate_limits: { primary: primary ?? secondary, secondary: primary ? secondary : null }, at: Date.now() };
+  const scoped = scopedFromLimits(b?.limits);
+  return {
+    type: "claude.usage",
+    rate_limits: { primary: primary ?? secondary, secondary: primary ? secondary : null },
+    ...(scoped.length ? { scoped } : {}),
+    at: Date.now(),
+  };
+}
+
+/**
+ * Per-model weekly windows from the same body: entries of `limits` with kind `weekly_scoped`
+ * carry the model in `scope.model.display_name` (measured 2026-10-15:
+ * `{"kind":"weekly_scoped","group":"weekly","percent":2,…,"scope":{"model":{"id":null,
+ * "display_name":"Fable"},"surface":null},"is_active":false}`). They ride beside
+ * `rate_limits` (which the GUI and the tray read) so those readers keep working unchanged.
+ */
+function scopedFromLimits(limits: unknown): Record<string, number | string>[] {
+  if (!Array.isArray(limits)) return [];
+  const out: Record<string, number | string>[] = [];
+  for (const entry of limits as ScopedEntry[]) {
+    if (!entry || typeof entry !== "object" || entry.kind !== "weekly_scoped") continue;
+    const name = entry.scope?.model?.display_name;
+    const percent = entry.percent;
+    if (typeof name !== "string" || !name || typeof percent !== "number" || !Number.isFinite(percent)) continue;
+    const w: Record<string, number | string> = { name, used_percent: percent, window_minutes: WEEK };
+    const at = typeof entry.resets_at === "string" ? Date.parse(entry.resets_at) : NaN;
+    if (Number.isFinite(at)) w.reset_at = Math.round(at / 1000);
+    out.push(w);
+  }
+  return out;
 }
 
 type UsageSource = { credentials(): Promise<Credential[]> };

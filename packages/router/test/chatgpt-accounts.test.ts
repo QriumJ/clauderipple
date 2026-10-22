@@ -20,6 +20,7 @@ import {
 import { CredentialPool } from "../src/pool.ts";
 import { Logger } from "../src/log.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
+import { posixModes } from "../../../test/capabilities.ts";
 
 const log = new Logger(null, 1e9, 0, false);
 const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-codex-"));
@@ -58,7 +59,7 @@ test("store: distinct accounts are added, the same one signing in again replaces
   assert.equal(stored.length, 3);
   assert.equal(stored[0]!.accessToken, "tok-new");
   assert.equal(stored[0]!.planType, "plus");
-  assert.equal(fs.statSync(chatgptAccountsPath(home)).mode & 0o777, 0o600);
+  if (posixModes) assert.equal(fs.statSync(chatgptAccountsPath(home)).mode & 0o777, 0o600);
 });
 
 test("store: the single-login file is one account until the first write, then imported and retired", () => {
@@ -100,6 +101,16 @@ test("exhaustedForMs: out until the latest full window resets; not out below 100
   assert.equal(exhaustedForMs({ rate_limits: { primary: { used_percent: 99, reset_after_seconds: 10 } } }, now), undefined);
   assert.equal(exhaustedForMs({ rate_limits: { primary: { used_percent: 100, reset_after_seconds: 10 }, secondary: { used_percent: 100, reset_at: (now + 50_000) / 1000 } } }, now), 50_000);
   assert.equal(exhaustedForMs(null, now), undefined);
+});
+
+test("exhaustedForMs: a full window with credits left is not out; refused anyway, it rests until the reset", () => {
+  const now = 1_000_000;
+  const full = { primary: { used_percent: 100, reset_after_seconds: 10 } };
+  assert.equal(exhaustedForMs({ rate_limits: full, credits: { has_credits: true, unlimited: false } }, now), undefined);
+  assert.equal(exhaustedForMs({ rate_limits: full, credits: { has_credits: false, unlimited: true } }, now), undefined);
+  assert.equal(exhaustedForMs({ rate_limits: full, credits: { has_credits: false, unlimited: false } }, now), 10_000);
+  assert.equal(exhaustedForMs({ rate_limits: full, credits: { has_credits: true, unlimited: false, overage_limit_reached: true } }, now), 10_000);
+  assert.equal(exhaustedForMs({ rate_limits: full, credits: { has_credits: true, unlimited: false } }, now, false), 10_000);
 });
 
 test("pool: a due account refreshes once however many turns ask; a terminal rejection needs sign-in", async () => {

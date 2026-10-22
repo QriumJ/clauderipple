@@ -42,6 +42,37 @@ test("RequestLog keeps a bounded ring and reloads persisted JSONL", () => {
   }
 });
 
+test("an image record persists, reloads and counts under the image target", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-request-image-"));
+  try {
+    const file = path.join(dir, "requests.jsonl");
+    const log = new RequestLog(file);
+    log.add(record("image-1", {
+      at: "2026-10-21T10:00:00.000Z",
+      kind: "image",
+      source: "gpt-6-astra",
+      target: "image",
+      provider: "gpt",
+      stream: false,
+      usage: { input: 2249, cached: 0, output: 75 },
+      note: "1536x1024 low png, 1 reference(s)",
+    }));
+    log.add(record("turn"));
+    assert.deepEqual(log.list(10, { kind: "image" }).map((r) => r.id), ["image-1"]);
+    // A filter may name several kinds; a record matches any of them.
+    assert.deepEqual(log.list(10, { kind: ["messages", "image"] }).map((r) => r.id), ["turn", "image-1"]);
+    assert.deepEqual(log.list(10, { kind: ["count_tokens"] }), []);
+
+    const reloaded = new RequestLog(file);
+    assert.equal(reloaded.list(1, { kind: "image" })[0]!.kind, "image");
+    const usage = reloaded.usage(Date.parse("2026-10-21T10:00:00.000Z"), Date.parse("2026-10-21T11:00:00.000Z"));
+    assert.equal(usage.providers.gpt?.count, 1);
+    assert.deepEqual(usage.models.map((m) => [m.provider, m.model, m.input]), [["gpt", "image", 2249]]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("RequestLog computes success, usage, cache and latency summaries", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-request-summary-"));
   try {
@@ -56,6 +87,21 @@ test("RequestLog computes success, usage, cache and latency summaries", () => {
     assert.deepEqual(summary.providers.chatgpt, { count: 1, ok: 1, failed: 0, input: 20, cached: 80, cacheWrite: 0, output: 9, cacheHitPercent: 80, avgMs: 100 });
     assert.deepEqual(summary.providers.moonshot, { count: 1, ok: 0, failed: 1, input: 50, cached: 0, cacheWrite: 0, output: 0, cacheHitPercent: 0, avgMs: 300 });
     assert.deepEqual(summary.providers.anthropic, { count: 1, ok: 1, failed: 0, input: 2, cached: 98, cacheWrite: 100, output: 1, cacheHitPercent: 49, avgMs: 200 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a resent request is counted, but neither as a success nor as a failure", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-request-resent-"));
+  try {
+    const log = new RequestLog(path.join(dir, "requests.jsonl"));
+    log.add(record("a", { at: "2026-10-07T10:00:00.000Z", ms: 300, ok: false, status: 404, provider: "anthropic", resent: true }));
+    log.add(record("b", { at: "2026-10-07T10:00:01.000Z", ms: 100, provider: "anthropic" }));
+    const summary = log.summary(Date.parse("2026-10-07T09:59:00.000Z"));
+    assert.equal(summary.total.count, 2);
+    assert.equal(summary.total.ok, 1);
+    assert.equal(summary.total.failed, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -120,4 +166,58 @@ test("ResponseUsageTap inflates a gzip SSE stream side-band", async () => {
   assert.equal(r.usage?.input, 100);
   assert.equal(r.usage?.cached, 900);
   assert.equal(r.usage?.output, 42);
+});
+
+test("ResponseUsageTap keeps usage when a whole SSE body over 64KiB arrives at once (#55)", async () => {
+  const zlib = await import("node:zlib");
+  const delta = 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"' + "a".repeat(200) + '"}}\n\n';
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":7,"output_tokens":1}}}\n\n',
+    delta.repeat(400),
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}\n\n',
+  ].join("");
+  assert.ok(sse.length > 64 * 1024);
+  const expected = { usage: { input: 100, cached: 900, cacheWrite: 7, output: 42 }, stopReason: "end_turn" };
+  const gzip = new ResponseUsageTap("text/event-stream", "gzip");
+  gzip.feed(zlib.gzipSync(Buffer.from(sse)));
+  assert.deepEqual(gzip.finish(), expected);
+  const plain = new ResponseUsageTap("text/event-stream", "identity");
+  plain.feed(Buffer.from(sse));
+  assert.deepEqual(plain.finish(), expected);
+});
+
+test("ResponseUsageTap distinguishes explicit cache writes from absent/non-number values", () => {
+  for (const stream of [false, true]) {
+    for (const value of [0, 7, undefined, null, "0"]) {
+      const usage = { input_tokens: 5, output_tokens: 1, ...(value !== undefined ? { cache_creation_input_tokens: value } : {}) };
+      const tap = new ResponseUsageTap(stream ? "text/event-stream" : "application/json", undefined);
+      tap.feed(Buffer.from(stream
+        ? `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage } })}\n\n`
+        : JSON.stringify({ usage })));
+      if (stream) tap.feed(Buffer.from('event: message_delta\ndata: {"usage":{"output_tokens":9}}\n\n'));
+      assert.deepEqual(tap.finish().usage, { input: 5, cached: 0, ...(typeof value === "number" ? { cacheWrite: value } : {}), output: stream ? 9 : 1 });
+    }
+  }
+});
+
+test("ResponseUsageTap observes only the message id and reported tier, across split JSON/SSE", () => {
+  const message = { content: [{ id: "tool-id", text: 'quoted "id":"prompt-id"' }], id: "msg_actual", usage: { input_tokens: 1, service_tier: "standard" } };
+  for (const stream of [false, true]) {
+    const text = stream ? `event: message_start\ndata: ${JSON.stringify({ message })}\n\n` : JSON.stringify(message);
+    const tap = new ResponseUsageTap(stream ? "text/event-stream" : "application/json", undefined);
+    for (const char of text) tap.feed(Buffer.from(char));
+    assert.deepEqual(tap.finish(), { messageId: "msg_actual", servedTier: "standard", usage: { input: 1, cached: 0, output: 0 } });
+  }
+  const absent = new ResponseUsageTap("application/json", undefined);
+  absent.feed(Buffer.from(JSON.stringify({ content: [{ id: "tool-id" }], usage: { input_tokens: 1, service_tier: null } })));
+  assert.deepEqual(absent.finish(), { usage: { input: 1, cached: 0, output: 0 } });
+});
+
+test("ResponseUsageTap drops an over-long SSE line whole and reads the events after it", () => {
+  const tap = new ResponseUsageTap("text/event-stream", "identity");
+  tap.feed(Buffer.from('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}\n\n'));
+  tap.feed(Buffer.from("data: " + "x".repeat(70 * 1024)));
+  tap.feed(Buffer.from('data: {"type":"message_delta"}\n\n'));
+  tap.feed(Buffer.from('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}\n\n'));
+  assert.deepEqual(tap.finish(), { usage: { input: 5, cached: 0, output: 9 }, stopReason: "end_turn" });
 });

@@ -5,8 +5,10 @@
   evidence. Section 5 lists failure modes that must not be reintroduced.
 - Reference implementations (proxenos, chatgpt-codex-proxy) are behavioral
   specs only. **Never copy code from them.** Own implementation in TypeScript.
-- The live router is this repo, run by launchd (`com.clauderipple.router`,
-  127.0.0.1:8791, admin 8792). It is the user's daily driver: never kill or
+- The live router is this repo's npm build installed in `~/.clauderipple/lib`,
+  run by launchd (`com.clauderipple.router`, 127.0.0.1:8791, admin 8792). A
+  restart alone does not pick up repo changes: `npm pack` →
+  `npm install --prefix ~/.clauderipple/lib <tgz>` → `clauderipple restart`. It is the user's daily driver: never kill or
   restart it casually (`clauderipple restart` drains; see ARCHITECTURE §5).
   The Python prototype (`~/.local/share/claude-router/`, 8790) and proxenos
   (8787) were retired 2026-09-20 — do not consult or start them.

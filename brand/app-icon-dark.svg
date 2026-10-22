@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100" role="img" aria-label="ClaudeRipple">
+  <title>ClaudeRipple</title>
+  <defs><clipPath id="tile"><rect width="100" height="100" rx="22.4"/></clipPath></defs>
+  <rect width="100" height="100" rx="22.4" fill="#1d1b26"/>
+  <g clip-path="url(#tile)" fill="none" stroke="#a594f5" stroke-width="2.4">
+    <circle cx="50" cy="57" r="44" stroke-opacity="0.16"/>
+    <circle cx="50" cy="57" r="52" stroke-opacity="0.1"/>
+    <circle cx="50" cy="57" r="60" stroke-opacity="0.06"/>
+  </g>
+  <g transform="translate(15 14.2) scale(1.25)">
+    <path d="M24.7 12.29C24.2 6.2 29.2 2.4 35 2.6C39.6 2.8 42.6 6.2 41.6 9.8C40.6 8 38.6 7 36.8 7.6C35 8.2 35 11 36.33 13.92Z" fill="#a594f5"/>
+    <circle cx="28" cy="31" r="16.5" fill="none" stroke="#a594f5" stroke-width="5"/>
+    <path d="M49.47 21.44A23.5 23.5 0 0 1 49.47 40.56M6.53 40.56A23.5 23.5 0 0 1 6.53 21.44" fill="none" stroke="#a594f5" stroke-width="2.4" stroke-linecap="round"/>
+    <rect x="20.6" y="26.2" width="3.6" height="5.6" rx="1.8" fill="#ecebf2"/>
+    <rect x="31.8" y="26.2" width="3.6" height="5.6" rx="1.8" fill="#ecebf2"/>
+    <path d="M24.8 36.2q3.2 2.6 6.4 0" fill="none" stroke="#ecebf2" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

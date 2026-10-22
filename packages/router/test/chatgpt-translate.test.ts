@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { StreamMapper, conversationId, conversationKey, estimateTokens, formatSse, normalizeSchema, toResponsesRequest, toolNameForResponses, toolNameRestoreMap, type AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 import { SseParser } from "../src/providers/chatgpt/sse.ts";
+import { encodeEnvelope } from "../src/reasoning.ts";
 
 const opts = { model: "gpt-5.6-terra", effort: "high", identity: true };
 
@@ -124,6 +125,14 @@ test("tool_choice and images map; string content works", () => {
   assert.equal(m1.content[0]?.type, "output_text");
   assert.equal((r.tools?.[0]?.parameters as { type: string }).type, "object");
   assert.ok(estimateTokens(turn1) > 10);
+});
+
+test("the image hint follows the addendum on the session's own turns, never a subagent's", () => {
+  const req = { model: "m", messages: [{ role: "user" as const, content: "draw a cat" }] };
+  const main = toResponsesRequest(req, { ...opts, identity: false, instructionsAppend: "Be brief.", imageHint: "IMG" });
+  assert.equal(main.instructions, "Be brief.\n\nIMG");
+  const sub = toResponsesRequest(req, { ...opts, identity: false, instructionsAppend: "Be brief.", imageHint: "IMG", subagent: true });
+  assert.equal(sub.instructions, "Be brief.");
 });
 
 test("stream mapper: text + tool call + completed → Anthropic events with usage and stop_reason", () => {
@@ -370,4 +379,94 @@ test("Claude Code's fast mode asks the ChatGPT backend for the Codex fast tier",
   assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, opts).service_tier, "priority");
   assert.equal(toResponsesRequest(turn1, opts).service_tier, undefined);
   assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, opts).service_tier, undefined);
+});
+
+// Claude Code never asks for `speed: "fast"` on a GPT request (its own client gate), so the tier is
+// chosen by the provider's switches: one for the session's own turns, one for a subagent's.
+test("the provider's Fast switches ask for the Codex fast tier, main and subagent apart", () => {
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true } }).service_tier, "priority", "a main turn with fast.main on");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { subagent: true } }).service_tier, undefined, "a main turn is not a subagent's");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { subagent: true }, subagent: true }).service_tier, "priority", "a subagent turn with fast.subagent on");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true }, subagent: true }).service_tier, undefined, "fast.main does not reach a subagent's turn");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: true, subagent: true } }).service_tier, "priority");
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: { main: false, subagent: false } }).service_tier, undefined);
+  assert.equal(toResponsesRequest(turn1, { ...opts, fast: {} }).service_tier, undefined);
+  assert.equal(toResponsesRequest(turn1, opts).service_tier, undefined, "no switches at all is the default");
+});
+
+test("`speed: fast` still asks for the fast tier whichever switch is on", () => {
+  assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, { ...opts, fast: { main: false, subagent: false } }).service_tier, "priority");
+  assert.equal(toResponsesRequest({ ...turn1, speed: "fast" }, { ...opts, fast: { main: true }, subagent: true }).service_tier, "priority");
+  // The switch is the provider's own choice, so it asks for the tier whatever `speed` says.
+  assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, { ...opts, fast: { main: true } }).service_tier, "priority");
+  assert.equal(toResponsesRequest({ ...turn1, speed: "standard" }, { ...opts, fast: { main: false, subagent: false } }).service_tier, undefined);
+});
+
+// ---- reasoning replay (reasoning.ts) -----------------------------------------------------------
+
+const codexEnv = { p: "chatgpt", m: "gpt-5.6-terra" };
+
+// One round trip at the translate layer: the carrier the response path writes is read back by the
+// request path, and comes out as the backend's own item in the position the CLI replayed it from.
+test("a carrier written by the mapper is replayed by the request builder, in place", () => {
+  const mapper = new StreamMapper("gpt-5.6-terra", 0, new Map(), codexEnv.p);
+  const events = mapper.feed({ type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } })
+    .concat(mapper.feed({ type: "response.reasoning_summary_text.delta", delta: "why", item_id: "rs_1" }))
+    .concat(mapper.feed({ type: "response.output_item.done", item: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" } }));
+  // The block as the client assembles it from the stream: text from the deltas, signature last.
+  const start = events.find((e) => e.event === "content_block_start")!;
+  const block = start.data.content_block as { type: "thinking"; thinking: string; signature: string };
+  assert.equal(block.type, "thinking");
+  block.thinking = events
+    .filter((e) => e.event === "content_block_delta" && (e.data.delta as { type: string }).type === "thinking_delta")
+    .map((e) => (e.data.delta as { thinking: string }).thinking)
+    .join("");
+  for (const e of events) {
+    if (e.event === "content_block_delta" && (e.data.delta as { type: string }).type === "signature_delta") {
+      block.signature = (e.data.delta as { signature: string }).signature;
+    }
+  }
+  assert.equal(block.thinking, "why");
+
+  const carried = { replayed: 0, undecodable: 0 };
+  const arrived: (string | undefined)[] = [];
+  const out = toResponsesRequest(
+    {
+      ...turn1,
+      messages: [
+        turn1.messages[0]!,
+        { role: "assistant", content: [block, { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "a.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] },
+      ],
+    },
+    { ...opts, env: codexEnv, carried, onArrival: (_item, afterCallId) => arrived.push(afterCallId) },
+  );
+  assert.deepEqual(out.input.map((i) => i.type), ["message", "reasoning", "function_call", "function_call_output"]);
+  assert.deepEqual(out.input[1], { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "gAAAAsealed" });
+  assert.deepEqual(out.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(carried, { replayed: 1, undecodable: 0 });
+  assert.deepEqual(arrived, [undefined], "a lead-in summary belongs before the turn's calls, where the item itself came first");
+});
+
+// A conversation with no reasoning of ours maps its input exactly as before, and still asks for the
+// sealed item: without `include` a `store: false` backend hands back nothing, so a conversation that
+// waited until it already carried reasoning would never start carrying any.
+test("no carrier: the old input, and include asked for from the first turn", () => {
+  const withEnv = toResponsesRequest(turn2, { ...opts, env: codexEnv });
+  const without = toResponsesRequest(turn2, opts);
+  assert.deepEqual(withEnv.include, ["reasoning.encrypted_content"]);
+  assert.deepEqual(withEnv.input, without.input);
+  assert.equal(JSON.stringify(withEnv.input).includes("encrypted_content"), false);
+});
+
+// `replay: false` is the retry after the backend refused a sealed blob, and it must be exactly the
+// request this adapter sent before any of this existed.
+test("replay: false carries nothing and asks for nothing", () => {
+  const block = { type: "thinking" as const, thinking: "why", signature: encodeEnvelope({ w: "responses" as const, p: "chatgpt", m: "gpt-5.6-terra", r: { type: "reasoning", encrypted_content: "gAAAAsealed" } }) };
+  const out = toResponsesRequest(
+    { ...turn1, messages: [turn1.messages[0]!, { role: "assistant", content: [block, { type: "tool_use", id: "call_1", name: "Read", input: {} }] }] },
+    { ...opts, env: codexEnv, replay: false },
+  );
+  assert.equal(out.include, undefined);
+  assert.equal(JSON.stringify(out.input).includes("encrypted_content"), false);
 });

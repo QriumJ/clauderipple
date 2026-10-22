@@ -89,12 +89,44 @@ test("adapter streams text, carries the API key, and maps usage", async () => {
   const sent = seen.at(-1)!;
   assert.equal(sent.path, "/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse");
   assert.equal(sent.headers["x-goog-api-key"], "test-key");
+  // Plain AI Studio requests are unchanged: no relay session header and no ClaudeRipple User-Agent.
+  assert.equal(sent.headers["x-opencode-session"], undefined);
+  assert.doesNotMatch(String(sent.headers["user-agent"] ?? ""), /^clauderipple\//);
   assert.equal(sent.body.model, undefined, "the model goes in the path, not the body");
   assert.deepEqual((sent.body.contents as { role: string }[]).map((c) => c.role), ["user"]);
   assert.match(response.text, /"text":"Hi "/);
   assert.match(response.text, /"text":"there"/);
   assert.match(response.text, /"cache_read_input_tokens":30/);
   assert.match(response.text, /"stop_reason":"end_turn"/);
+});
+
+// OpenCode Go's Gemini endpoint refuses a request without `x-opencode-session` (400
+// MissingSessionID), and its docs ask clients for a distinctive User-Agent. The key still travels
+// on `x-goog-api-key`, never as a bearer.
+test("a session header, the provider's own headers and a client user-agent ride on the api-key wire", async () => {
+  mode = "text";
+  adapter = new GoogleAdapter("opencode", {
+    type: "google", auth: "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}`,
+    sessionHeader: "x-opencode-session", headers: { "x-extra": "kept" },
+  }, home, log);
+  await call(request);
+  const first = seen.at(-1)!;
+  assert.equal(first.path, "/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse");
+  assert.equal(first.headers["x-goog-api-key"], "test-key");
+  assert.equal(first.headers.authorization, undefined, "this wire never carries a bearer");
+  assert.equal(first.headers["x-extra"], "kept");
+  assert.match(String(first.headers["user-agent"]), /^clauderipple\/\d+\.\d+\.\d+$/);
+  const session = String(first.headers["x-opencode-session"]);
+  assert.match(session, /^[0-9a-f]{32}$/, "a stable conversation id, not a per-request random");
+
+  // The same conversation keeps the same value; a different one gets a different value.
+  await call(request);
+  assert.equal(seen.at(-1)!.headers["x-opencode-session"], session);
+  await call({ ...request, metadata: { user_id: "another-conversation" }, messages: [{ role: "user", content: "another conversation" }] });
+  assert.notEqual(seen.at(-1)!.headers["x-opencode-session"], session);
+
+  // Leave the following tests on the plain AI Studio adapter.
+  adapter = new GoogleAdapter("fake", { type: "google", auth: "api-key", apiKey: "test-key", url: `http://127.0.0.1:${upstreamPort}` }, home, log);
 });
 
 test("a function call carries its signature into the store and it is replayed on the next turn", async () => {
